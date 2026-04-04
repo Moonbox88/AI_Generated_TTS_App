@@ -1,0 +1,21 @@
+kokoro>=0.9.4
+Pillow
+soundfile
+sounddevice
+PyMuPDF
+python-docx
+deep-translator
+
+# Japanese
+fugashi
+unidic-lite
+jaconv
+mojimoji
+pyopenjtalk
+
+# Chinese
+jieba
+ordered-set
+pypinyin
+cn2an
+pypinyin-dict
