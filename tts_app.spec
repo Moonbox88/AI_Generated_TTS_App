@@ -4,36 +4,32 @@
 #   Windows: pyinstaller tts_app.spec
 
 import sys
-from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
+
+# Collect kokoro and misaki package data before Analysis
+kokoro_datas, kokoro_binaries, kokoro_hiddenimports = collect_all("kokoro")
+misaki_datas, misaki_binaries, misaki_hiddenimports = collect_all("misaki")
 
 a = Analysis(
     ["gui.py"],
     pathex=[],
-    binaries=[],
+    binaries=kokoro_binaries + misaki_binaries,
     datas=[
         ("assets/icon.png", "assets"),
         ("assets/icon.ico", "assets"),
-    ],
+    ] + kokoro_datas + misaki_datas,
     hiddenimports=[
-        # Kokoro / misaki language modules
         "misaki.en",
         "misaki.ja",
         "misaki.zh",
-        "misaki.es",
-        "misaki.fr",
-        "misaki.hi",
-        "misaki.it",
-        "misaki.pt",
         "misaki.ko",
-        # Deep-translator
         "deep_translator",
         "deep_translator.google",
-        # Document parsers
         "fitz",
         "docx",
-    ],
+    ] + kokoro_hiddenimports + misaki_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -44,16 +40,10 @@ a = Analysis(
     noarchive=False,
 )
 
-# Collect all files from kokoro and misaki packages
-from PyInstaller.utils.hooks import collect_all
-
-for pkg in ("kokoro", "misaki"):
-    pkg_datas, pkg_binaries, pkg_hiddenimports = collect_all(pkg)
-    a.datas += pkg_datas
-    a.binaries += pkg_binaries
-    a.hiddenimports += pkg_hiddenimports
-
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+# Icon is only supported on Windows and macOS by PyInstaller
+icon = "assets/icon.ico" if sys.platform == "win32" else None
 
 exe = EXE(
     pyz,
@@ -69,7 +59,7 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,  # No terminal window
-    icon="assets/icon.ico",
+    console=False,
+    icon=icon,
     onefile=True,
 )
