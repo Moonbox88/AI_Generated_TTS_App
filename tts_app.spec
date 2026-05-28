@@ -8,28 +8,32 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-# Collect kokoro and misaki package data before Analysis
+# Collect package data before Analysis
 kokoro_datas, kokoro_binaries, kokoro_hiddenimports = collect_all("kokoro")
 misaki_datas, misaki_binaries, misaki_hiddenimports = collect_all("misaki")
+sd_datas, sd_binaries, sd_hiddenimports = collect_all("sounddevice")
+sf_datas, sf_binaries, sf_hiddenimports = collect_all("soundfile")
 
 a = Analysis(
     ["gui.py"],
     pathex=[],
-    binaries=kokoro_binaries + misaki_binaries,
+    binaries=kokoro_binaries + misaki_binaries + sd_binaries + sf_binaries,
     datas=[
         ("assets/icon.png", "assets"),
         ("assets/icon.ico", "assets"),
-    ] + kokoro_datas + misaki_datas,
+    ] + kokoro_datas + misaki_datas + sd_datas + sf_datas,
     hiddenimports=[
         "misaki.en",
         "misaki.ja",
         "misaki.zh",
         "misaki.ko",
+        "sounddevice",
+        "soundfile",
         "deep_translator",
         "deep_translator.google",
         "fitz",
         "docx",
-    ] + kokoro_hiddenimports + misaki_hiddenimports,
+    ] + kokoro_hiddenimports + misaki_hiddenimports + sd_hiddenimports + sf_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
