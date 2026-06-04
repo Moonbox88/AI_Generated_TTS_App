@@ -4,6 +4,9 @@
 
 set -e
 
+echo "Installing Japanese support..."
+pip install -r requirements-ja.txt
+
 echo "Generating icon assets..."
 python3 create_icon.py
 

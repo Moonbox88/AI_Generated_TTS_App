@@ -6,12 +6,11 @@ PyMuPDF
 python-docx
 deep-translator
 
-# Japanese
+# Japanese (no pyopenjtalk — see requirements-ja.txt)
 fugashi
 unidic-lite
 jaconv
 mojimoji
-pyopenjtalk
 
 # Chinese
 jieba

@@ -2,6 +2,11 @@
 REM Build a single-file Windows executable.
 REM Run from the project root with the venv active.
 
+echo NOTE: Japanese TTS requires pyopenjtalk which needs VS Build Tools.
+echo If you have them installed, run: pip install -r requirements-ja.txt
+echo Skipping pyopenjtalk for standard Windows build...
+echo.
+
 echo Generating icon assets...
 python create_icon.py
 

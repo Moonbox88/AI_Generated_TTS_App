@@ -1,0 +1,6 @@
+# Full Japanese TTS support — requires a C++ compiler to build.
+# Linux:   install automatically via requirements.txt
+# Windows: requires Visual Studio Build Tools with "Desktop development with C++"
+#          https://visualstudio.microsoft.com/visual-cpp-build-tools/
+
+pyopenjtalk
