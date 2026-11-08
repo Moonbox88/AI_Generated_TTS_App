@@ -2,14 +2,16 @@
 """Text-to-Speech GUI — Phase 2 (Tkinter)."""
 
 import pathlib
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from main import LANGUAGES, VOICES
 from parsers import extract_text
-from translator import needs_translation, translate
-from tts import DEFAULT_LANG, DEFAULT_VOICE, PlaybackController, speak
+from translator import translate
+from tts import Playback, prepare, speak
+from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES,
+                    needs_translation, voices_for_lang)
 
 SUPPORTED_FILETYPES = [
     ("Documents", "*.txt *.pdf *.docx"),
@@ -36,7 +38,8 @@ class App(tk.Tk):
         self._volume = tk.DoubleVar(value=1.0)
         self._do_translate = tk.BooleanVar(value=False)
 
-        self._controller: PlaybackController | None = None
+        self._controller: Playback | None = None
+        self._voice_ids: dict[str, str] = {}  # combobox label -> voice id
         self._synthesising = False
 
         self._build_ui()
@@ -80,16 +83,17 @@ class App(tk.Tk):
 
         # Row 0: Language + Voice
         ttk.Label(options_frame, text="Language:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        lang_values = [f"{k} — {v}" for k, v in LANGUAGES.items()]
+        lang_values = [f"{k} — {v.name}" for k, v in LANGUAGES.items()]
         self._lang_cb = ttk.Combobox(options_frame, values=lang_values, state="readonly", width=24)
         self._lang_cb.current(0)
         self._lang_cb.grid(row=0, column=1, padx=5, pady=5, sticky="w")
         self._lang_cb.bind("<<ComboboxSelected>>", self._on_lang_changed)
 
         ttk.Label(options_frame, text="Voice:").grid(row=0, column=2, padx=5, pady=5, sticky="w")
-        self._voice_cb = ttk.Combobox(options_frame, textvariable=self._voice, state="readonly", width=18)
+        self._voice_cb = ttk.Combobox(options_frame, state="readonly", width=24)
         self._voice_cb.grid(row=0, column=3, padx=5, pady=5, sticky="w")
-        self._update_voice_list("a")
+        self._voice_cb.bind("<<ComboboxSelected>>", self._on_voice_changed)
+        self._update_voice_list(DEFAULT_LANG)
 
         # Row 1: Speed slider
         ttk.Label(options_frame, text="Speed:").grid(row=1, column=0, padx=5, pady=4, sticky="w")
@@ -113,8 +117,7 @@ class App(tk.Tk):
         self._vol_label = ttk.Label(vol_frame, text="100%", width=5)
         self._vol_slider = ttk.Scale(vol_frame, from_=0.0, to=1.0, variable=self._volume,
                                      orient="horizontal", length=200,
-                                     command=lambda v: self._vol_label.config(
-                                         text=f"{int(float(v) * 100)}%"))
+                                     command=self._on_volume_changed)
         self._vol_slider.set(1.0)
         self._vol_slider.pack(side="left", padx=4)
         ttk.Label(vol_frame, text="100%").pack(side="left")
@@ -168,6 +171,11 @@ class App(tk.Tk):
     # Playback state management
     # ------------------------------------------------------------------
 
+    def _on_volume_changed(self, value):
+        self._vol_label.config(text=f"{int(float(value) * 100)}%")
+        if self._controller is not None:
+            self._controller.set_volume(float(value))
+
     def _set_playback_active(self, active: bool):
         if active:
             self._speak_btn.config(state="disabled")
@@ -182,27 +190,41 @@ class App(tk.Tk):
             self._controller = None
 
     def _poll_playback(self):
-        """Poll every 200ms to detect when playback finishes naturally."""
-        if self._controller is None:
+        """Poll every 200ms to detect when playback finishes."""
+        ctrl = self._controller
+        if ctrl is None:
             return
-        if not self._controller.is_playing and not self._controller.is_paused:
-            self.after(0, lambda: self._status.set("Done."))
-            self.after(0, lambda: self._set_playback_active(False))
-        else:
+        if not ctrl.is_finished:
             self.after(200, self._poll_playback)
+            return
+        if ctrl.error is not None:
+            self._status.set("Error.")
+            messagebox.showerror("Speech error", str(ctrl.error))
+        else:
+            self._status.set("Done.")
+        self._set_playback_active(False)
+
+    def _status_async(self, message: str):
+        """Set the status bar from any thread."""
+        self.after(0, lambda: self._status.set(message))
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _get_text(self) -> str | None:
+        """Read the input. Must run on the Tk thread (it may show dialogs)."""
         file_path = self._file_path.get()
         if file_path:
             try:
-                return extract_text(file_path)
-            except (FileNotFoundError, ValueError) as e:
+                text = extract_text(file_path)
+            except Exception as e:
                 messagebox.showerror("File error", str(e))
                 return None
+            if not text.strip():
+                messagebox.showwarning("No text", "No readable text found in that file.")
+                return None
+            return text
         text = self._text_box.get("1.0", "end").strip()
         if not text:
             messagebox.showwarning("No input", "Enter some text or load a file.")
@@ -213,20 +235,54 @@ class App(tk.Tk):
         return self._lang_cb.get().split(" — ")[0]
 
     def _update_voice_list(self, lang_code: str):
-        filtered = [v for v in VOICES if v.startswith(lang_code)]
-        self._voice_cb.config(values=filtered)
-        if self._voice.get() not in filtered:
-            self._voice.set(filtered[0] if filtered else "")
+        voices = voices_for_lang(lang_code)
+        self._voice_ids = {f"{v.label}  [{v.engine}]": v.id for v in voices}
+        labels = list(self._voice_ids)
+        self._voice_cb.config(values=labels)
+        current = self._voice.get()
+        if current not in self._voice_ids.values():
+            current = voices[0].id if voices else ""
+        self._select_voice(current)
 
-    def _get_final_text(self, lang: str) -> str | None:
+    def _select_voice(self, voice_id: str):
+        self._voice.set(voice_id)
+        for label, vid in self._voice_ids.items():
+            if vid == voice_id:
+                self._voice_cb.set(label)
+                return
+        self._voice_cb.set("")
+
+    def _on_voice_changed(self, _event=None):
+        self._voice.set(self._voice_ids.get(self._voice_cb.get(), ""))
+
+    def _translate_if_needed(self, text: str, lang: str, translate_on: bool) -> str:
+        """Worker-thread step: translate and show the preview."""
+        if translate_on and needs_translation(lang):
+            def progress(done, total):
+                if total > 1:
+                    self._status_async(f"Translating... ({done}/{total})")
+            self._status_async("Translating...")
+            text = translate(text, lang, on_progress=progress)
+            self.after(0, lambda: self._show_preview(text))
+        return text
+
+    def _gather_job(self) -> dict | None:
+        """Snapshot every input on the Tk thread before starting a worker."""
+        voice = self._voice.get()
+        if not voice:
+            messagebox.showwarning("No voice", "Choose a voice first.")
+            return None
         text = self._get_text()
         if not text:
             return None
-        if self._do_translate.get() and needs_translation(lang):
-            self.after(0, lambda: self._status.set("Translating..."))
-            text = translate(text, lang)
-            self.after(0, lambda: self._show_preview(text))
-        return text
+        return {
+            "text": text,
+            "lang": self._selected_lang_code(),
+            "voice": voice,
+            "speed": round(self._speed.get(), 1),
+            "volume": self._volume.get(),
+            "translate": self._do_translate.get(),
+        }
 
     def _show_preview(self, text: str):
         self._preview_frame.pack(fill="x", padx=10, pady=5, before=self._btn_frame)
@@ -281,25 +337,41 @@ class App(tk.Tk):
             self._output_path.set(path)
 
     def _on_speak(self):
-        lang = self._selected_lang_code()
-        voice = self._voice.get()
-        speed = round(self._speed.get(), 1)
-        volume = self._volume.get()
+        job = self._gather_job()
+        if job is None:
+            return
         output = self._output_path.get() or None
+        self._set_busy(True)
 
         def do_speak():
-            text = self._get_final_text(lang)
-            if not text:
+            try:
+                text = self._translate_if_needed(job["text"], job["lang"], job["translate"])
+                prepare(job["voice"], on_status=self._status_async)
+                ctrl = speak(text, voice=job["voice"], speed=job["speed"],
+                             volume=job["volume"], output_file=output,
+                             on_status=self._status_async)
+            except Exception as e:
+                self.after(0, lambda err=e: self._on_job_failed(err))
                 return
-            self.after(0, lambda: self._status.set("Synthesising..."))
-            ctrl = speak(text, voice=voice, lang=lang, speed=speed,
-                         volume=volume, output_file=output)
-            self._controller = ctrl
-            self.after(0, lambda: self._status.set("Playing..."))
-            self.after(0, lambda: self._set_playback_active(True))
-            self.after(200, self._poll_playback)
+            self.after(0, lambda: self._on_playback_started(ctrl))
 
         threading.Thread(target=do_speak, daemon=True).start()
+
+    def _on_playback_started(self, ctrl: Playback):
+        self._controller = ctrl
+        ctrl.set_volume(self._volume.get())  # pick up slider moves since Speak
+        self._set_playback_active(True)
+        self.after(200, self._poll_playback)
+
+    def _on_job_failed(self, error: Exception):
+        self._status.set("Error.")
+        self._set_busy(False)
+        messagebox.showerror("Error", str(error))
+
+    def _set_busy(self, busy: bool):
+        state = "disabled" if busy else "normal"
+        self._speak_btn.config(state=state)
+        self._save_btn.config(state=state)
 
     def _on_pause_resume(self):
         if self._controller is None:
@@ -308,7 +380,6 @@ class App(tk.Tk):
             self._controller.resume()
             self._pause_btn.config(text="Pause")
             self._status.set("Playing...")
-            self.after(200, self._poll_playback)
         else:
             self._controller.pause()
             self._pause_btn.config(text="Resume")
@@ -330,25 +401,27 @@ class App(tk.Tk):
             self._output_path.set(path)
             output = path
 
-        lang = self._selected_lang_code()
-        voice = self._voice.get()
-        speed = round(self._speed.get(), 1)
-        volume = self._volume.get()
+        job = self._gather_job()
+        if job is None:
+            return
+        self._set_busy(True)
 
         def do_save():
-            text = self._get_final_text(lang)
-            if not text:
+            try:
+                text = self._translate_if_needed(job["text"], job["lang"], job["translate"])
+                prepare(job["voice"], on_status=self._status_async)
+                self._status_async("Saving...")
+                speak(text, voice=job["voice"], speed=job["speed"],
+                      output_file=output, play=False).wait()
+                translated = job["translate"] and needs_translation(job["lang"])
+                if translated:
+                    pathlib.Path(output).with_suffix(".txt").write_text(text, encoding="utf-8")
+            except Exception as e:
+                self.after(0, lambda err=e: self._on_job_failed(err))
                 return
-            self.after(0, lambda: self._status.set("Saving..."))
-            speak(text, voice=voice, lang=lang, speed=speed,
-                  volume=volume, output_file=output)
-            if self._do_translate.get() and needs_translation(lang):
-                txt_path = output.rsplit(".", 1)[0] + ".txt"
-                with open(txt_path, "w", encoding="utf-8") as f:
-                    f.write(text)
-                self.after(0, lambda: self._status.set(f"Saved audio + translated text to {output}"))
-            else:
-                self.after(0, lambda: self._status.set(f"Saved to {output}"))
+            msg = (f"Saved audio + translated text to {output}" if translated
+                   else f"Saved to {output}")
+            self.after(0, lambda: (self._status.set(msg), self._set_busy(False)))
 
         threading.Thread(target=do_save, daemon=True).start()
 
@@ -358,6 +431,46 @@ class App(tk.Tk):
         self.destroy()
 
 
+_SELFTEST_TEXT = {
+    "a": "Hello.", "b": "Hello.", "j": "こんにちは。", "z": "你好。", "e": "Hola.",
+    "f": "Bonjour.", "h": "नमस्ते।", "i": "Ciao.", "p": "Olá.",
+    "pl": "Dzień dobry.", "ro": "Bună ziua.",
+}
+
+
+def selftest(report_path: str | None = None) -> int:
+    """Synthesise one phrase per language without playing it.
+
+    Exists so a frozen build can be checked for missing bundled data
+    without clicking through the GUI: `TextToSpeech --selftest [report.txt]`.
+    """
+    import traceback
+    from tts import synthesise
+    from voices import default_voice_for_lang
+
+    lines, failures = [], 0
+    for code, lang in LANGUAGES.items():
+        voice = default_voice_for_lang(code)
+        try:
+            audio, rate = synthesise(_SELFTEST_TEXT.get(code, "Hello."), voice=voice)
+            ok = audio.size > 0
+            lines.append(f"{'PASS' if ok else 'FAIL'}  {code:<3} {voice:<22} "
+                         f"{audio.size / rate if ok else 0:.2f}s @ {rate} Hz")
+            failures += not ok
+        except Exception:
+            failures += 1
+            lines.append(f"FAIL  {code:<3} {voice:<22} "
+                         + traceback.format_exc().strip().splitlines()[-1])
+    report = "\n".join(lines) + f"\n{failures} failure(s)\n"
+    print(report, end="")
+    if report_path:
+        pathlib.Path(report_path).write_text(report, encoding="utf-8")
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        args = sys.argv[sys.argv.index("--selftest") + 1:]
+        sys.exit(selftest(args[0] if args else None))
     app = App()
     app.mainloop()

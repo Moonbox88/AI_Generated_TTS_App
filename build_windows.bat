@@ -8,10 +8,11 @@ echo Skipping pyopenjtalk for standard Windows build...
 echo.
 
 echo Generating icon assets...
+pip install pyinstaller
 python create_icon.py
 
 echo Building Windows executable...
-pyinstaller tts_app.spec
+python -m PyInstaller --noconfirm tts_app.spec
 
 echo.
 echo Done. Executable is at: dist\TextToSpeech.exe

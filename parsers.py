@@ -2,12 +2,18 @@
 
 import pathlib
 import re
+from typing import Optional
+
+# Extraction is re-run on every Speak and every Save, and a large PDF takes
+# seconds to parse, so results are cached against the file's mtime and size.
+_CACHE_LIMIT = 8
+_cache: dict[tuple, str] = {}
 
 
 def clean_text(text: str) -> str:
-    """Normalise PDF/plain-text extracted text for TTS.
+    """Normalise extracted text for TTS.
 
-    Joins mid-sentence line wraps introduced by PDF layout so Kokoro
+    Joins mid-sentence line wraps introduced by PDF layout so the engine
     doesn't pause at every visual line break.
     """
     text = text.replace('\r\n', '\n').replace('\r', '\n')
@@ -37,15 +43,24 @@ def parse_txt(path: pathlib.Path) -> str:
 
 def parse_pdf(path: pathlib.Path) -> str:
     import fitz  # PyMuPDF
-    doc = fitz.open(str(path))
-    raw = "\n".join(page.get_text() for page in doc)
+    with fitz.open(str(path)) as doc:
+        raw = "\n".join(page.get_text() for page in doc)
     return clean_text(raw)
 
 
 def parse_docx(path: pathlib.Path) -> str:
     from docx import Document
     doc = Document(str(path))
-    return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+
+    blocks = [p.text for p in doc.paragraphs if p.text.strip()]
+    # Tables hold real prose in many documents and were previously dropped.
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text.strip()]
+            if cells:
+                blocks.append(". ".join(cells))
+
+    return clean_text("\n\n".join(blocks))
 
 
 PARSERS = {
@@ -55,11 +70,34 @@ PARSERS = {
 }
 
 
-def extract_text(path: str) -> str:
+def _cache_key(path: pathlib.Path) -> Optional[tuple]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (str(path.resolve()), stat.st_mtime_ns, stat.st_size)
+
+
+def clear_cache() -> None:
+    _cache.clear()
+
+
+def extract_text(path: str, use_cache: bool = True) -> str:
     p = pathlib.Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
     suffix = p.suffix.lower()
     if suffix not in PARSERS:
         raise ValueError(f"Unsupported file type '{suffix}'. Supported: {list(PARSERS)}")
-    return PARSERS[suffix](p)
+
+    key = _cache_key(p) if use_cache else None
+    if key is not None and key in _cache:
+        return _cache[key]
+
+    text = PARSERS[suffix](p)
+
+    if key is not None:
+        if len(_cache) >= _CACHE_LIMIT:
+            _cache.pop(next(iter(_cache)))
+        _cache[key] = text
+    return text

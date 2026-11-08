@@ -1,56 +1,22 @@
 #!/usr/bin/env python3
-"""Text-to-Speech CLI — Phase 1."""
+"""Text-to-Speech CLI."""
 
 import argparse
+import pathlib
 import sys
 
 from parsers import extract_text
 from translator import translate
-from tts import DEFAULT_LANG, DEFAULT_VOICE, speak
-
-VOICES = [
-    # American English
-    "af_heart", "af_alloy", "af_aoede", "af_bella", "af_jessica",
-    "af_kore", "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
-    "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam",
-    "am_michael", "am_onyx", "am_puck", "am_santa",
-    # British English
-    "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
-    "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
-    # Japanese
-    "jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo",
-    # Mandarin Chinese
-    "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
-    "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
-    # Spanish
-    "ef_dora", "em_alex", "em_santa",
-    # French
-    "ff_siwis",
-    # Hindi
-    "hf_alpha", "hf_beta", "hm_omega", "hm_psi",
-    # Italian
-    "if_sara", "im_nicola",
-    # Brazilian Portuguese
-    "pf_dora", "pm_alex", "pm_santa",
-]
-
-LANGUAGES = {
-    "a": "American English",
-    "b": "British English",
-    "j": "Japanese",
-    "z": "Mandarin Chinese",
-    "e": "Spanish",
-    "f": "French",
-    "h": "Hindi",
-    "i": "Italian",
-    "p": "Brazilian Portuguese",
-}
+from tts import speak
+from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES, VOICE_IDS,
+                    default_voice_for_lang, get_voice, needs_translation,
+                    voices_for_lang)
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tts",
-        description="Convert text or documents to speech using Kokoro-82M.",
+        description="Convert text or documents to speech using Kokoro-82M and Piper.",
     )
 
     source = p.add_mutually_exclusive_group(required=True)
@@ -61,13 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--stdin", action="store_true",
                         help="Read text from stdin")
 
-    p.add_argument("-v", "--voice", default=DEFAULT_VOICE,
-                   choices=VOICES, metavar="VOICE",
-                   help=f"Voice ID (default: {DEFAULT_VOICE}). Choices: {', '.join(VOICES)}")
+    p.add_argument("-v", "--voice", default=None,
+                   choices=VOICE_IDS, metavar="VOICE",
+                   help="Voice ID (default: the first voice for the chosen language). "
+                        "See --list-voices")
     p.add_argument("-l", "--lang", default=DEFAULT_LANG,
                    choices=list(LANGUAGES), metavar="LANG",
                    help="Language code. Choices: " +
-                        ", ".join(f"{k}={v}" for k, v in LANGUAGES.items()) +
+                        ", ".join(f"{k}={v.name}" for k, v in LANGUAGES.items()) +
                         f" (default: {DEFAULT_LANG})")
     p.add_argument("-o", "--output", metavar="FILE",
                    help="Save audio to this .wav file (optional)")
@@ -76,7 +43,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--volume", type=float, default=1.0, metavar="VOLUME",
                    help="Volume level 0.0 to 1.0 (default: 1.0)")
     p.add_argument("--translate", action="store_true",
-                   help="Translate input text from English to the target language before speaking")
+                   help="Translate input text from English to the target language first")
+    p.add_argument("--no-play", action="store_true",
+                   help="Synthesise to --output without playing audio")
     p.add_argument("--list-voices", action="store_true",
                    help="List available voices and exit")
     p.add_argument("--list-langs", action="store_true",
@@ -85,21 +54,49 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _list_voices() -> None:
+    print("Available voices:")
+    for code, lang in LANGUAGES.items():
+        matches = voices_for_lang(code)
+        if not matches:
+            continue
+        print(f"\n  {lang.name} (-l {code})")
+        for voice in matches:
+            print(f"    {voice.id:<24} {voice.label}  [{voice.engine}]")
+
+
+def _resolve_voice(args, parser) -> str:
+    """Pick the voice, defaulting per language and rejecting mismatches."""
+    if args.voice is None:
+        voice = default_voice_for_lang(args.lang)
+        if voice is None:
+            parser.error(f"No voices available for language '{args.lang}'")
+        return voice
+
+    selected = get_voice(args.voice)
+    if selected.lang != args.lang:
+        # An explicit voice wins, but say so rather than silently disagreeing.
+        if args.lang != DEFAULT_LANG:
+            print(f"Note: voice '{args.voice}' is {LANGUAGES[selected.lang].name}; "
+                  f"using that instead of {LANGUAGES[args.lang].name}.", file=sys.stderr)
+        args.lang = selected.lang
+    return selected.id
+
+
 def main():
     parser = build_parser()
-    args = parser.parse_args()
 
-    if args.list_voices:
-        print("Available voices:")
-        for v in VOICES:
-            print(f"  {v}")
+    if "--list-voices" in sys.argv:
+        _list_voices()
         sys.exit(0)
-
-    if args.list_langs:
+    if "--list-langs" in sys.argv:
         print("Available language codes:")
-        for code, name in LANGUAGES.items():
-            print(f"  {code}  {name}")
+        for code, lang in LANGUAGES.items():
+            print(f"  {code:<3} {lang.name}")
         sys.exit(0)
+
+    args = parser.parse_args()
+    voice = _resolve_voice(args, parser)
 
     # Gather text
     if args.file:
@@ -111,7 +108,8 @@ def main():
     elif args.text:
         text = args.text
     else:  # stdin
-        print("Reading from stdin (Ctrl+D to finish):")
+        if sys.stdin.isatty():
+            print("Reading from stdin (Ctrl+D to finish):")
         text = sys.stdin.read()
 
     if not text.strip():
@@ -119,18 +117,35 @@ def main():
         sys.exit(1)
 
     if args.translate:
-        print(f"Translating to {LANGUAGES[args.lang]}...")
-        text = translate(text, args.lang)
-        print(f"Translated: {text}")
-        if args.output:
-            txt_path = args.output.rsplit(".", 1)[0] + ".txt"
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(text)
-            print(f"Translated text saved to {txt_path}")
+        if not needs_translation(args.lang):
+            print(f"Target is {LANGUAGES[args.lang].name}; nothing to translate.")
+        else:
+            print(f"Translating to {LANGUAGES[args.lang].name}...")
+            try:
+                text = translate(text, args.lang)
+            except Exception as e:
+                print(f"Error: translation failed: {e}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Translated: {text}")
+            if args.output:
+                txt_path = pathlib.Path(args.output).with_suffix(".txt")
+                txt_path.write_text(text, encoding="utf-8")
+                print(f"Translated text saved to {txt_path}")
 
-    ctrl = speak(text, voice=args.voice, lang=args.lang, speed=args.speed,
-                 volume=args.volume, output_file=args.output)
-    ctrl.wait()
+    if args.no_play and not args.output:
+        print("Error: --no-play requires --output.", file=sys.stderr)
+        sys.exit(1)
+
+    playback = speak(text, voice=voice, speed=args.speed, volume=args.volume,
+                     output_file=args.output, play=not args.no_play,
+                     on_status=lambda m: print(m))
+    try:
+        playback.wait()
+    except KeyboardInterrupt:
+        playback.stop()
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

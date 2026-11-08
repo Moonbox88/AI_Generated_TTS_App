@@ -4,14 +4,14 @@
 
 set -e
 
-echo "Installing Japanese support..."
-pip install -r requirements-ja.txt
+echo "Installing Japanese support and PyInstaller..."
+pip install -r requirements-ja.txt pyinstaller
 
 echo "Generating icon assets..."
 python3 create_icon.py
 
 echo "Building Linux executable..."
-pyinstaller tts_app.spec
+python3 -m PyInstaller --noconfirm tts_app.spec
 
 echo ""
 echo "Done. Executable is at: dist/TextToSpeech"

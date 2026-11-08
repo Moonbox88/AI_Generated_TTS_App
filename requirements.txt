@@ -1,4 +1,5 @@
 kokoro>=0.9.4
+piper-tts>=1.3  # Polish & Romanian voices (models download on first use)
 Pillow
 soundfile
 sounddevice

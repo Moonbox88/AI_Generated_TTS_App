@@ -8,6 +8,7 @@ __pycache__/
 # Virtual environments
 .venv/
 .tts_venv/
+tts_env/
 venv/
 env/
 
