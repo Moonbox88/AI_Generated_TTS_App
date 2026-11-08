@@ -31,3 +31,6 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Local Claude session notes
+tts_claude_session.txt
