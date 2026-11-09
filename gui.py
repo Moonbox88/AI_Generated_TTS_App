@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import gui_theme
+import settings
 import tts
 from parsers import extract_text
 from render_cache import RenderCache, RenderKey
@@ -37,7 +38,8 @@ class App(tk.Tk):
         self.geometry(f"800x{min(900, self.winfo_screenheight() - 80)}")
 
         self._fonts = gui_theme.setup_fonts(self)
-        self._theme = "light"
+        saved_theme = settings.load().get("theme")
+        self._theme = saved_theme if saved_theme in gui_theme.PALETTES else "light"
         self._palette = gui_theme.apply_theme(self, self._theme, self._fonts)
 
         self._file_path = tk.StringVar()
@@ -72,7 +74,9 @@ class App(tk.Tk):
     def _set_icon(self):
         icon_path = pathlib.Path(__file__).parent / "assets" / "icon.png"
         if icon_path.exists():
-            icon = tk.PhotoImage(file=str(icon_path))
+            # master=self: without it the image belongs to whichever Tk root
+            # was created first in the process, and iconphoto rejects it.
+            icon = tk.PhotoImage(master=self, file=str(icon_path))
             self.iconphoto(True, icon)
 
     # ------------------------------------------------------------------
@@ -273,6 +277,7 @@ class App(tk.Tk):
         self._theme = "dark" if self._theme == "light" else "light"
         self._palette = gui_theme.apply_theme(self, self._theme, self._fonts)
         self._apply_widget_theme()
+        settings.save({"theme": self._theme})  # best effort; see settings.py
 
     def _bind_shortcuts(self):
         def via(button):

@@ -17,6 +17,9 @@
 13. Why does `gui_theme.py` use the `clam` theme, and why are plain `tk.Text` widgets styled separately (`style_text`)?
 14. Why does the GUI only use symbols like ▶ ⇄ ☾ and never emoji such as 📄 or 💾?
 15. How does `_on_swap` turn "Polish → American English" into "English → Polish"? Why can't it just copy the target code into the source box?
+16. Where does `settings.py` store the theme on Linux and on Windows, and why does `save()` write a temp file and then `os.replace` it?
+17. `settings.load()` returns `{}` for a missing, corrupt or non-object file, and `save()` returns False instead of raising. Why is that the right behaviour for preferences?
+
 ## Answers
 1. Tk isn't thread-safe. `self.after(0, fn)` queues `fn` to run on the Tk main loop, which is the safe cross-thread hop.
 2. It snapshots every widget value on the Tk thread so the worker uses a consistent job dict, and the user changing a slider mid-job can't alter it.
@@ -34,5 +37,8 @@
 13. `clam` ships with Tk and, unlike native themes, lets every colour be set, so light/dark work everywhere with no new dependency (important for the PyInstaller build). ttk styles don't apply to classic Tk widgets such as Text and the combobox drop-down listbox, so those are configured directly.
 14. Tk 8.6 can't handle characters above U+FFFF (most emoji) and raises an error; the chosen symbols are in the Basic Multilingual Plane.
 15. The old source becomes the new target language (and voice list); the old target becomes the new source. The source list has one entry per language (one English), so the target is matched by translation code rather than copied (British English becomes the single English entry).
+16. `~/.config/text-to-speech/settings.json` (or `$XDG_CONFIG_HOME`), and `%APPDATA%\TextToSpeech\settings.json`. Writing then renaming is atomic: a crash mid-write leaves the old file intact rather than a truncated one that would no longer parse.
+17. A preference is a convenience. A bad file, a read-only home folder or a full disk should cost the user their theme, not the app; the GUI falls back to light (it also ignores unknown theme names).
+
 ## Reusable snippet
-`_status_async` + `_gather_job` + worker-thread-then-`after` is the standard recipe for any Tk app doing slow work. Copy those three methods as a template. `gui_theme.py` is a self-contained light/dark ttk theme you can drop into any Tkinter app: call `setup_fonts`, `apply_theme`, then `style_text` on Text widgets.
+`_status_async` + `_gather_job` + worker-thread-then-`after` is the standard recipe for any Tk app doing slow work. Copy those three methods as a template. `gui_theme.py` is a self-contained light/dark ttk theme you can drop into any Tkinter app: call `setup_fonts`, `apply_theme`, then `style_text` on Text widgets. `settings.py` is a drop-in per-user JSON preferences store (platform paths, atomic write, never throws).
