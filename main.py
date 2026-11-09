@@ -13,6 +13,25 @@ from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES, VOICE_IDS,
                     voices_for_lang)
 
 
+SPEED_RANGE = (0.5, 2.0)   # matches the GUI slider
+VOLUME_RANGE = (0.0, 1.0)
+
+
+def _bounded_float(name: str, low: float, high: float):
+    """argparse type: a finite float within [low, high]."""
+    def parse(value: str) -> float:
+        try:
+            number = float(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{name} must be a number, got '{value}'")
+        # `not low <= number <= high` also rejects nan, which fails every comparison.
+        if not low <= number <= high:
+            raise argparse.ArgumentTypeError(
+                f"{name} must be between {low} and {high}, got {value}")
+        return number
+    return parse
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tts",
@@ -38,10 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
                         f" (default: {DEFAULT_LANG})")
     p.add_argument("-o", "--output", metavar="FILE",
                    help="Save audio to this .wav file (optional)")
-    p.add_argument("-s", "--speed", type=float, default=1.0, metavar="SPEED",
-                   help="Playback speed multiplier, e.g. 0.5 to 2.0 (default: 1.0)")
-    p.add_argument("--volume", type=float, default=1.0, metavar="VOLUME",
-                   help="Volume level 0.0 to 1.0 (default: 1.0)")
+    p.add_argument("-s", "--speed", type=_bounded_float("speed", *SPEED_RANGE),
+                   default=1.0, metavar="SPEED",
+                   help="Speech speed multiplier, %s to %s (default: 1.0)" % SPEED_RANGE)
+    p.add_argument("--volume", type=_bounded_float("volume", *VOLUME_RANGE),
+                   default=1.0, metavar="VOLUME",
+                   help="Volume level %s to %s (default: 1.0)" % VOLUME_RANGE)
     p.add_argument("--translate", action="store_true",
                    help="Translate input text from English to the target language first")
     p.add_argument("--no-play", action="store_true",
