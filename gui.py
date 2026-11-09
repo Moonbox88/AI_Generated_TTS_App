@@ -8,13 +8,15 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import gui_theme
+import tts
 from parsers import extract_text
 from render_cache import RenderCache, RenderKey
 from translator import iter_translate
-import tts
 from tts import Playback, speak
-from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES,
-                    needs_translation, voices_for_lang)
+from voices import (AUTO_DETECT, DEFAULT_LANG, DEFAULT_SOURCE, DEFAULT_VOICE,
+                    LANGUAGES, get_language, needs_translation, source_languages,
+                    source_name, voices_for_lang)
 
 SUPPORTED_FILETYPES = [
     ("Documents", "*.txt *.pdf *.docx"),
@@ -24,29 +26,46 @@ SUPPORTED_FILETYPES = [
     ("All files", "*.*"),
 ]
 
+SHORTCUT_HINT = "Ctrl+Enter speak  ·  Ctrl+P pause  ·  Esc stop  ·  Ctrl+S save  ·  Ctrl+O open"
+
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Text to Speech")
-        self.resizable(True, True)
-        self.minsize(540, 520)
+        self.minsize(660, 640)
+        self.geometry(f"800x{min(900, self.winfo_screenheight() - 80)}")
+
+        self._fonts = gui_theme.setup_fonts(self)
+        self._theme = "light"
+        self._palette = gui_theme.apply_theme(self, self._theme, self._fonts)
 
         self._file_path = tk.StringVar()
+        self._file_name = tk.StringVar()
         self._voice = tk.StringVar(value=DEFAULT_VOICE)
-        self._lang = tk.StringVar(value=DEFAULT_LANG)
+        self._source = tk.StringVar(value=DEFAULT_SOURCE)
         self._output_path = tk.StringVar()
         self._status = tk.StringVar(value="Ready.")
+        self._counts = tk.StringVar(value="0 words  ·  0 characters")
+        self._translate_info = tk.StringVar()
+        self._target_name = tk.StringVar()
         self._speed = tk.DoubleVar(value=1.0)
         self._volume = tk.DoubleVar(value=1.0)
         self._do_translate = tk.BooleanVar(value=False)
 
-        self._controller: Playback | None = None
+        # Comboboxes show names; these map them back to codes.
+        self._lang_codes = {lang.name: code for code, lang in LANGUAGES.items()}
+        self._source_codes = {name: code for code, name in source_languages()}
         self._voice_ids: dict[str, str] = {}  # combobox label -> voice id
-        self._synthesising = False
+
+        self._controller: Playback | None = None
         self._renders = RenderCache()  # last finished render, for instant Save
 
         self._build_ui()
+        self._apply_widget_theme()
+        self._bind_shortcuts()
+        self._status.trace_add("write", self._on_status_changed)
+        self._update_translate_controls()
         self._set_icon()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -60,120 +79,239 @@ class App(tk.Tk):
     # UI construction
     # ------------------------------------------------------------------
 
+    # Rows of the main column. It uses grid rather than pack because only
+    # grid lets one row (the text box) give up space when the window is too
+    # short; pack would clip whatever was packed last, i.e. the buttons.
+    ROW_HEADER, ROW_TEXT, ROW_VOICE, ROW_TRANSLATE, ROW_PREVIEW, ROW_OUTPUT, \
+        ROW_ACTIONS, ROW_PROGRESS = range(8)
+
+    def _card(self, parent, title: str, row: int):
+        """A bordered section with a heading row. Returns (card, heading row)."""
+        card = ttk.Frame(parent, style="Card.TFrame", padding=(16, 12, 16, 14))
+        card.grid(row=row, column=0, sticky="nsew", pady=(0, 10))
+        head = ttk.Frame(card, style="Inner.TFrame")
+        head.pack(fill="x", pady=(0, 8))
+        ttk.Label(head, text=title, style="Heading.Card.TLabel").pack(side="left")
+        return card, head
+
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 5}
+        # Status bar first, so it keeps its place at the bottom when resizing.
+        status_bar = ttk.Frame(self, style="Inner.TFrame")
+        status_bar.pack(side="bottom", fill="x")
+        self._status_label = ttk.Label(status_bar, textvariable=self._status,
+                                       style="Status.TLabel")
+        self._status_label.pack(side="left", fill="x", expand=True)
+        ttk.Label(status_bar, text=SHORTCUT_HINT, style="Status.TLabel").pack(side="right")
 
-        # --- Text input ---
-        text_frame = ttk.LabelFrame(self, text="Text input")
-        text_frame.pack(fill="both", expand=True, **pad)
+        outer = ttk.Frame(self, padding=(20, 16, 20, 8))
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(self.ROW_TEXT, weight=1)  # the only row that flexes
 
-        self._text_box = tk.Text(text_frame, height=10, wrap="word", undo=True)
-        self._text_box.pack(fill="both", expand=True, padx=5, pady=5)
+        # --- Header ---
+        header = ttk.Frame(outer)
+        header.grid(row=self.ROW_HEADER, column=0, sticky="ew", pady=(0, 12))
+        ttk.Label(header, text="Text to Speech", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="Read, translate and save with Kokoro & Piper voices",
+                  style="Subtitle.TLabel").pack(side="left", padx=(12, 0), pady=(6, 0))
+        self._theme_btn = ttk.Button(header, style="Header.Ghost.TButton",
+                                     command=self._toggle_theme)
+        self._theme_btn.pack(side="right")
+
+        self._build_text_card(outer)
+        self._build_voice_card(outer)
+        self._build_translate_card(outer)
+        self._build_preview_card(outer)
+        self._build_output_card(outer)
+        self._build_actions(outer)
+
+    def _build_text_card(self, parent):
+        card, head = self._card(parent, "Text", self.ROW_TEXT)
+        ttk.Button(head, text="Open file…", command=self._browse_file).pack(side="right")
+        self._file_chip = ttk.Frame(head, style="Inner.TFrame")
+        ttk.Label(self._file_chip, textvariable=self._file_name,
+                  style="Chip.Card.TLabel").pack(side="left")
+        ttk.Button(self._file_chip, text="✕", width=2, style="Ghost.TButton",
+                   command=self._clear_file).pack(side="left", padx=(2, 0))
+
+        box = ttk.Frame(card, style="Inner.TFrame")
+        box.pack(fill="both", expand=True)
+        self._text_box = tk.Text(box, height=6, wrap="word", undo=True,
+                                 font=self._fonts["text"])
+        scroll = ttk.Scrollbar(box, command=self._text_box.yview)
+        self._text_box.configure(yscrollcommand=scroll.set)
+        self._text_box.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
         self._text_box.bind("<<Modified>>", self._on_text_modified)
 
-        # --- File input ---
-        file_frame = ttk.LabelFrame(self, text="Or load a file (.txt / .pdf / .docx)")
-        file_frame.pack(fill="x", **pad)
+        ttk.Label(card, textvariable=self._counts,
+                  style="Muted.Card.TLabel").pack(anchor="w", pady=(6, 0))
 
-        self._file_label = ttk.Label(file_frame, textvariable=self._file_path,
-                                     foreground="grey", width=50, anchor="w")
-        self._file_label.pack(side="left", padx=5, pady=5)
-        ttk.Button(file_frame, text="Browse", command=self._browse_file).pack(side="right", padx=5, pady=5)
-        ttk.Button(file_frame, text="Clear", command=self._clear_file).pack(side="right", pady=5)
+    def _build_voice_card(self, parent):
+        card, _ = self._card(parent, "Voice", self.ROW_VOICE)
+        grid = ttk.Frame(card, style="Inner.TFrame")
+        grid.pack(fill="x")
+        grid.columnconfigure((1, 3), weight=1, uniform="col")
 
-        # --- Options ---
-        options_frame = ttk.LabelFrame(self, text="Options")
-        options_frame.pack(fill="x", **pad)
-
-        # Row 0: Language + Voice
-        ttk.Label(options_frame, text="Language:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        lang_values = [f"{k} — {v.name}" for k, v in LANGUAGES.items()]
-        self._lang_cb = ttk.Combobox(options_frame, values=lang_values, state="readonly", width=24)
-        self._lang_cb.current(0)
-        self._lang_cb.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        ttk.Label(grid, text="Language", style="Card.TLabel").grid(
+            row=0, column=0, sticky="w", padx=(0, 10))
+        self._lang_cb = ttk.Combobox(grid, values=list(self._lang_codes), state="readonly")
+        self._lang_cb.set(LANGUAGES[DEFAULT_LANG].name)
+        self._lang_cb.grid(row=0, column=1, sticky="ew", padx=(0, 18))
         self._lang_cb.bind("<<ComboboxSelected>>", self._on_lang_changed)
 
-        ttk.Label(options_frame, text="Voice:").grid(row=0, column=2, padx=5, pady=5, sticky="w")
-        self._voice_cb = ttk.Combobox(options_frame, state="readonly", width=24)
-        self._voice_cb.grid(row=0, column=3, padx=5, pady=5, sticky="w")
+        ttk.Label(grid, text="Voice", style="Card.TLabel").grid(
+            row=0, column=2, sticky="w", padx=(0, 10))
+        self._voice_cb = ttk.Combobox(grid, state="readonly")
+        self._voice_cb.grid(row=0, column=3, sticky="ew")
         self._voice_cb.bind("<<ComboboxSelected>>", self._on_voice_changed)
         self._update_voice_list(DEFAULT_LANG)
 
-        # Row 1: Speed slider
-        ttk.Label(options_frame, text="Speed:").grid(row=1, column=0, padx=5, pady=4, sticky="w")
-        speed_frame = ttk.Frame(options_frame)
-        speed_frame.grid(row=1, column=1, columnspan=3, padx=5, sticky="ew")
-        ttk.Label(speed_frame, text="0.5x").pack(side="left")
-        self._speed_slider = ttk.Scale(speed_frame, from_=0.5, to=2.0, variable=self._speed,
-                                       orient="horizontal", length=200,
-                                       command=lambda v: self._speed_label.config(
-                                           text=f"{float(v):.1f}x"))
-        self._speed_slider.pack(side="left", padx=4)
-        ttk.Label(speed_frame, text="2.0x").pack(side="left")
-        self._speed_label = ttk.Label(speed_frame, text="1.0x", width=5)
-        self._speed_label.pack(side="left", padx=6)
+        self._speed_label = self._slider(grid, 1, 0, "Speed", self._speed, 0.5, 2.0,
+                                         self._on_speed_changed, "1.0×")
+        self._vol_label = self._slider(grid, 1, 2, "Volume", self._volume, 0.0, 1.0,
+                                       self._on_volume_changed, "100%")
 
-        # Row 2: Volume slider
-        ttk.Label(options_frame, text="Volume:").grid(row=2, column=0, padx=5, pady=4, sticky="w")
-        vol_frame = ttk.Frame(options_frame)
-        vol_frame.grid(row=2, column=1, columnspan=3, padx=5, sticky="ew")
-        ttk.Label(vol_frame, text="0%").pack(side="left")
-        self._vol_label = ttk.Label(vol_frame, text="100%", width=5)
-        self._vol_slider = ttk.Scale(vol_frame, from_=0.0, to=1.0, variable=self._volume,
-                                     orient="horizontal", length=200,
-                                     command=self._on_volume_changed)
-        self._vol_slider.set(1.0)
-        self._vol_slider.pack(side="left", padx=4)
-        ttk.Label(vol_frame, text="100%").pack(side="left")
-        self._vol_label.pack(side="left", padx=6)
+    def _slider(self, grid, row, col, label, variable, low, high, command, initial):
+        ttk.Label(grid, text=label, style="Card.TLabel").grid(
+            row=row, column=col, sticky="w", padx=(0, 10), pady=(12, 0))
+        cell = ttk.Frame(grid, style="Inner.TFrame")
+        cell.grid(row=row, column=col + 1, sticky="ew", pady=(12, 0),
+                  padx=(0, 18) if col == 0 else 0)
+        value = ttk.Label(cell, text=initial, width=5, anchor="e", style="Value.Card.TLabel")
+        value.pack(side="right")
+        scale = ttk.Scale(cell, from_=low, to=high, variable=variable,
+                          orient="horizontal", command=command)
+        scale.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        if label == "Volume":
+            self._vol_slider = scale
+        return value
 
-        # Row 3: Translate checkbox
-        self._translate_chk = ttk.Checkbutton(
-            options_frame, text="Translate from English",
-            variable=self._do_translate, command=self._on_translate_toggled)
-        self._translate_chk.grid(row=3, column=0, columnspan=2, padx=5, pady=2, sticky="w")
+    def _build_translate_card(self, parent):
+        card, head = self._card(parent, "Translate", self.ROW_TRANSLATE)
+        ttk.Checkbutton(head, text="Translate before speaking", variable=self._do_translate,
+                        command=self._update_translate_controls).pack(side="right")
 
-        # Row 4: Output file
-        ttk.Label(options_frame, text="Save to:").grid(row=4, column=0, padx=5, pady=5, sticky="w")
-        ttk.Entry(options_frame, textvariable=self._output_path, width=30).grid(
-            row=4, column=1, columnspan=2, padx=5, pady=5, sticky="ew")
-        ttk.Button(options_frame, text="Browse", command=self._browse_output).grid(
-            row=4, column=3, padx=5, pady=5)
+        row = ttk.Frame(card, style="Inner.TFrame")
+        row.pack(fill="x")
+        ttk.Label(row, text="From", style="Card.TLabel").pack(side="left", padx=(0, 10))
+        self._source_cb = ttk.Combobox(row, values=list(self._source_codes),
+                                       state="readonly", width=20)
+        self._source_cb.set(source_name(DEFAULT_SOURCE))
+        self._source_cb.pack(side="left")
+        self._source_cb.bind("<<ComboboxSelected>>", self._on_source_changed)
+        self._swap_btn = ttk.Button(row, text="⇄", width=3, style="Ghost.TButton",
+                                    command=self._on_swap)
+        self._swap_btn.pack(side="left", padx=8)
+        ttk.Label(row, text="To", style="Card.TLabel").pack(side="left", padx=(0, 10))
+        ttk.Label(row, textvariable=self._target_name,
+                  style="Value.Card.TLabel").pack(side="left")
+        ttk.Label(row, text="(the voice's language)",
+                  style="Muted.Card.TLabel").pack(side="left", padx=(6, 0))
 
-        options_frame.columnconfigure(1, weight=1)
+        self._translate_info_label = ttk.Label(card, textvariable=self._translate_info,
+                                               style="Muted.Card.TLabel")
+        self._translate_info_label.pack(anchor="w", pady=(8, 0))
 
-        # --- Translation preview ---
-        self._preview_frame = ttk.LabelFrame(self, text="Translated text (preview)")
-        self._preview_box = tk.Text(self._preview_frame, height=4, wrap="word",
-                                    state="disabled", foreground="grey")
-        self._preview_box.pack(fill="both", expand=True, padx=5, pady=5)
+    def _build_preview_card(self, parent):
+        # Built now, shown (grid) only while a translation is displayed.
+        self._preview_card, head = self._card(parent, "Translation", self.ROW_PREVIEW)
+        ttk.Button(head, text="Copy", style="Ghost.TButton",
+                   command=self._copy_preview).pack(side="right")
+        self._preview_box = tk.Text(self._preview_card, height=3, wrap="word",
+                                    state="disabled", font=self._fonts["text"])
+        self._preview_box.pack(fill="both", expand=True)
+        self._preview_card.grid_remove()  # remembers its grid options for later
 
-        # --- Action buttons ---
-        self._btn_frame = ttk.Frame(self)
-        self._btn_frame.pack(pady=8)
+    def _build_output_card(self, parent):
+        self._output_card, head = self._card(parent, "Save to", self.ROW_OUTPUT)
+        ttk.Button(head, text="Browse…", command=self._browse_output).pack(side="right")
+        ttk.Entry(head, textvariable=self._output_path).pack(
+            side="left", fill="x", expand=True, padx=(14, 8))
 
-        self._speak_btn = ttk.Button(self._btn_frame, text="Speak", width=12, command=self._on_speak)
-        self._speak_btn.grid(row=0, column=0, padx=6)
+    def _build_actions(self, parent):
+        bar = ttk.Frame(parent)
+        bar.grid(row=self.ROW_ACTIONS, column=0, sticky="ew", pady=(2, 6))
+        self._speak_btn = ttk.Button(bar, text="▶  Speak", style="Accent.TButton",
+                                     command=self._on_speak)
+        self._speak_btn.pack(side="left")
+        self._pause_btn = ttk.Button(bar, text="❚❚  Pause", command=self._on_pause_resume,
+                                     state="disabled")
+        self._pause_btn.pack(side="left", padx=(8, 0))
+        self._stop_btn = ttk.Button(bar, text="■  Stop", command=self._on_stop,
+                                    state="disabled")
+        self._stop_btn.pack(side="left", padx=(8, 0))
+        self._save_btn = ttk.Button(bar, text="Save audio", command=self._on_save)
+        self._save_btn.pack(side="right")
 
-        self._pause_btn = ttk.Button(self._btn_frame, text="Pause", width=12,
-                                     command=self._on_pause_resume, state="disabled")
-        self._pause_btn.grid(row=0, column=1, padx=6)
+        self._progress = ttk.Progressbar(parent, mode="indeterminate")
+        self._progress.grid(row=self.ROW_PROGRESS, column=0, sticky="ew", pady=(4, 6))
+        self._progress.grid_remove()  # shown only while a job runs
 
-        self._stop_btn = ttk.Button(self._btn_frame, text="Stop", width=12,
-                                    command=self._on_stop, state="disabled")
-        self._stop_btn.grid(row=0, column=2, padx=6)
+    def _show_progress(self, running: bool):
+        if running:
+            self._progress.grid()
+            self._progress.start(12)
+        else:
+            self._progress.stop()
+            self._progress.grid_remove()
 
-        self._save_btn = ttk.Button(self._btn_frame, text="Save to file", width=12,
-                                    command=self._on_save)
-        self._save_btn.grid(row=0, column=3, padx=6)
+    # ------------------------------------------------------------------
+    # Theme and shortcuts
+    # ------------------------------------------------------------------
 
-        # --- Status bar ---
-        ttk.Label(self, textvariable=self._status, anchor="w",
-                  relief="sunken", padding=(6, 2)).pack(fill="x", side="bottom")
+    def _apply_widget_theme(self):
+        p = self._palette
+        gui_theme.style_text(self._text_box, p)
+        gui_theme.style_text(self._preview_box, p, readonly=True)
+        for combobox in (self._lang_cb, self._voice_cb, self._source_cb):
+            gui_theme.style_combobox_list(combobox, p)
+        self._theme_btn.config(text="☾  Dark" if self._theme == "light" else "☀  Light")
+        self._on_status_changed()
+
+    def _toggle_theme(self):
+        self._theme = "dark" if self._theme == "light" else "light"
+        self._palette = gui_theme.apply_theme(self, self._theme, self._fonts)
+        self._apply_widget_theme()
+
+    def _bind_shortcuts(self):
+        def via(button):
+            def handler(_event):
+                if button.instate(["!disabled"]):
+                    button.invoke()
+                return "break"  # e.g. stop Ctrl+Enter also inserting a newline
+            return handler
+
+        def open_file(_event):
+            self._browse_file()
+            return "break"  # Tk's Text binds Ctrl+O to "insert newline"
+
+        bindings = {"<Control-Return>": via(self._speak_btn),
+                    "<Control-s>": via(self._save_btn),
+                    "<Control-p>": via(self._pause_btn),
+                    "<Escape>": via(self._stop_btn),
+                    "<Control-o>": open_file}
+        for sequence, handler in bindings.items():
+            # The text box gets its own copy so "break" beats its class bindings.
+            self.bind(sequence, handler)
+            self._text_box.bind(sequence, handler)
+
+    def _on_status_changed(self, *_):
+        message = self._status.get()
+        if message.startswith("Error"):
+            style = "Error.Status.TLabel"
+        elif message.startswith(("Saved", "Done")):
+            style = "Success.Status.TLabel"
+        else:
+            style = "Status.TLabel"
+        self._status_label.configure(style=style)
 
     # ------------------------------------------------------------------
     # Playback state management
     # ------------------------------------------------------------------
+
+    def _on_speed_changed(self, value):
+        self._speed_label.config(text=f"{float(value):.1f}×")
 
     def _on_volume_changed(self, value):
         self._vol_label.config(text=f"{int(float(value) * 100)}%")
@@ -184,13 +322,14 @@ class App(tk.Tk):
         if active:
             self._speak_btn.config(state="disabled")
             self._save_btn.config(state="disabled")
-            self._pause_btn.config(state="normal", text="Pause")
+            self._pause_btn.config(state="normal", text="❚❚  Pause")
             self._stop_btn.config(state="normal")
         else:
             self._speak_btn.config(state="normal")
             self._save_btn.config(state="normal")
-            self._pause_btn.config(state="disabled", text="Pause")
+            self._pause_btn.config(state="disabled", text="❚❚  Pause")
             self._stop_btn.config(state="disabled")
+            self._show_progress(False)
             self._controller = None
 
     def _poll_playback(self):
@@ -228,13 +367,21 @@ class App(tk.Tk):
         return text
 
     def _selected_lang_code(self) -> str:
-        return self._lang_cb.get().split(" — ")[0]
+        return self._lang_codes[self._lang_cb.get()]
+
+    def _set_lang(self, code: str):
+        self._lang_cb.set(LANGUAGES[code].name)
+        self._on_lang_changed()
+
+    def _set_source(self, code: str):
+        self._source.set(code)
+        self._source_cb.set(source_name(code))
+        self._update_translate_controls()
 
     def _update_voice_list(self, lang_code: str):
         voices = voices_for_lang(lang_code)
-        self._voice_ids = {f"{v.label}  [{v.engine}]": v.id for v in voices}
-        labels = list(self._voice_ids)
-        self._voice_cb.config(values=labels)
+        self._voice_ids = {f"{v.label}  ·  {v.engine.title()}": v.id for v in voices}
+        self._voice_cb.config(values=list(self._voice_ids))
         current = self._voice.get()
         if current not in self._voice_ids.values():
             current = voices[0].id if voices else ""
@@ -248,12 +395,49 @@ class App(tk.Tk):
                 return
         self._voice_cb.set("")
 
-    def _on_voice_changed(self, _event=None):
-        self._voice.set(self._voice_ids.get(self._voice_cb.get(), ""))
+    def _update_counts(self, content: str):
+        if self._file_path.get():
+            self._counts.set(f"Will read {self._file_name.get()} when you press Speak")
+            return
+        words, chars = len(content.split()), len(content)
+        self._counts.set(f"{words:,} word{'s' * (words != 1)}  ·  "
+                         f"{chars:,} character{'s' * (chars != 1)}")
+
+    def _set_file(self, path: str):
+        self._file_path.set(path)
+        self._file_name.set(pathlib.Path(path).name if path else "")
+        if path:
+            self._file_chip.pack(side="right", padx=(0, 8))
+        else:
+            self._file_chip.pack_forget()
+
+    def _update_translate_controls(self):
+        """Enable/disable translation widgets and explain what will happen."""
+        on = self._do_translate.get()
+        source, target = self._source.get(), self._selected_lang_code()
+        self._target_name.set(LANGUAGES[target].name)
+        self._source_cb.state(["!disabled"] if on else ["disabled"])
+        self._swap_btn.state(["!disabled"] if on and source != AUTO_DETECT else ["disabled"])
+
+        warn = False
+        if not on:
+            info = "Off: text is read exactly as written."
+        elif not needs_translation(target, source):
+            info = f"The input is already {LANGUAGES[target].name}, so nothing will be translated."
+            warn = True
+        elif source == AUTO_DETECT:
+            info = f"Detects the input language and translates to {LANGUAGES[target].name}. Needs Google Translate."
+        else:
+            info = f"{source_name(source)} text will be translated to {LANGUAGES[target].name}, then spoken."
+        self._translate_info.set(info)
+        self._translate_info_label.configure(
+            style="Warn.Card.TLabel" if warn else "Muted.Card.TLabel")
+        if not on:
+            self._hide_preview()
 
     @staticmethod
     def _wants_translation(job: dict) -> bool:
-        return job["translate"] and needs_translation(job["lang"])
+        return job["translate"] and needs_translation(job["lang"], job["source"])
 
     def _segments(self, job: dict, text: str, collected: list[str]):
         """Text for speak(), translated lazily a piece at a time.
@@ -271,7 +455,8 @@ class App(tk.Tk):
                                else "Translating...")
 
         self.after(0, lambda: self._show_preview(""))
-        for piece in iter_translate(text, job["lang"], on_progress=progress):
+        for piece in iter_translate(text, job["lang"], on_progress=progress,
+                                    source=job["source"]):
             collected.append(piece)
             self.after(0, lambda p=piece: self._append_preview(p))
             yield piece
@@ -285,12 +470,13 @@ class App(tk.Tk):
         file_path = self._file_path.get()
         text = "" if file_path else self._text_box.get("1.0", "end").strip()
         if not file_path and not text:
-            messagebox.showwarning("No input", "Enter some text or load a file.")
+            messagebox.showwarning("No input", "Enter some text or open a file.")
             return None
         return {
             "file": file_path,
             "text": text,
             "lang": self._selected_lang_code(),
+            "source": self._source.get(),
             "voice": voice,
             "speed": round(self._speed.get(), 1),
             "volume": self._volume.get(),
@@ -298,7 +484,7 @@ class App(tk.Tk):
         }
 
     def _show_preview(self, text: str):
-        self._preview_frame.pack(fill="x", padx=10, pady=5, before=self._btn_frame)
+        self._preview_card.grid()
         self._preview_box.config(state="normal")
         self._preview_box.delete("1.0", "end")
         self._preview_box.insert("1.0", text)
@@ -309,10 +495,16 @@ class App(tk.Tk):
         if self._preview_box.get("1.0", "end-1c"):
             self._preview_box.insert("end", "\n\n")
         self._preview_box.insert("end", piece)
+        self._preview_box.see("end")
         self._preview_box.config(state="disabled")
 
     def _hide_preview(self):
-        self._preview_frame.pack_forget()
+        self._preview_card.grid_remove()
+
+    def _copy_preview(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._preview_box.get("1.0", "end-1c"))
+        self._status.set("Translation copied to the clipboard.")
 
     # ------------------------------------------------------------------
     # Event handlers
@@ -320,35 +512,46 @@ class App(tk.Tk):
 
     def _on_text_modified(self, _event=None):
         if self._text_box.edit_modified():
-            if self._text_box.get("1.0", "end").strip():
-                self._file_path.set("")
-                self._file_label.config(foreground="grey")
+            content = self._text_box.get("1.0", "end-1c")
+            if content.strip():
+                self._set_file("")  # typing replaces a loaded file
+            self._update_counts(content)
             self._text_box.edit_modified(False)
 
     def _on_lang_changed(self, _event=None):
-        lang = self._selected_lang_code()
-        self._update_voice_list(lang)
-        if needs_translation(lang):
-            self._translate_chk.state(["!disabled"])
-        else:
-            self._do_translate.set(False)
-            self._translate_chk.state(["disabled"])
-            self._hide_preview()
+        self._update_voice_list(self._selected_lang_code())
+        self._update_translate_controls()
 
-    def _on_translate_toggled(self):
-        if not self._do_translate.get():
-            self._hide_preview()
+    def _on_source_changed(self, _event=None):
+        self._source.set(self._source_codes[self._source_cb.get()])
+        self._update_translate_controls()
+
+    def _on_voice_changed(self, _event=None):
+        self._voice.set(self._voice_ids.get(self._voice_cb.get(), ""))
+
+    def _on_swap(self):
+        """Swap "from" and "to": read Polish as English <-> English as Polish."""
+        source = self._source.get()
+        if source == AUTO_DETECT:
+            return
+        # The source list has one entry per language (e.g. a single English),
+        # so map the current target onto it by translation code.
+        google = get_language(self._selected_lang_code()).google_code
+        new_source = next(code for code, _ in source_languages()
+                          if code != AUTO_DETECT and get_language(code).google_code == google)
+        self._set_source(new_source)
+        self._set_lang(source)
 
     def _browse_file(self):
         path = filedialog.askopenfilename(filetypes=SUPPORTED_FILETYPES)
         if path:
-            self._file_path.set(path)
-            self._file_label.config(foreground="black")
+            self._set_file(path)
             self._text_box.delete("1.0", "end")
+            self._update_counts("")
 
     def _clear_file(self):
-        self._file_path.set("")
-        self._file_label.config(foreground="grey")
+        self._set_file("")
+        self._update_counts(self._text_box.get("1.0", "end-1c"))
 
     def _browse_output(self):
         path = filedialog.asksaveasfilename(
@@ -401,7 +604,8 @@ class App(tk.Tk):
     @classmethod
     def _render_key(cls, job: dict, text: str) -> RenderKey:
         return RenderKey(text=text, lang=job["lang"], voice=job["voice"],
-                         speed=job["speed"], translate=cls._wants_translation(job))
+                         speed=job["speed"], translate=cls._wants_translation(job),
+                         source=job["source"])
 
     @classmethod
     def _translated_text(cls, job: dict, collected: list[str]) -> str | None:
@@ -422,17 +626,18 @@ class App(tk.Tk):
         state = "disabled" if busy else "normal"
         self._speak_btn.config(state=state)
         self._save_btn.config(state=state)
+        self._show_progress(busy)
 
     def _on_pause_resume(self):
         if self._controller is None:
             return
         if self._controller.is_paused:
             self._controller.resume()
-            self._pause_btn.config(text="Pause")
+            self._pause_btn.config(text="❚❚  Pause")
             self._status.set("Playing...")
         else:
             self._controller.pause()
-            self._pause_btn.config(text="Resume")
+            self._pause_btn.config(text="▶  Resume")
             self._status.set("Paused.")
 
     def _on_stop(self):

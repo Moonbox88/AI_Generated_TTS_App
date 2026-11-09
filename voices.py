@@ -142,6 +142,40 @@ def get_language(lang_code: str) -> Language:
         raise ValueError(f"Unknown language code '{lang_code}'") from None
 
 
-def needs_translation(lang_code: str) -> bool:
-    """True if the target language is something other than English."""
-    return lang_code not in ENGLISH_CODES
+# ----------------------------------------------------------------------
+# Translation source languages
+# ----------------------------------------------------------------------
+
+AUTO_DETECT = "auto"   # let the translator work out the input language
+DEFAULT_SOURCE = "a"   # English: the input language before sources existed
+
+
+def source_languages() -> list[tuple[str, str]]:
+    """(code, name) pairs for a "translate from" picker.
+
+    Auto-detect first, then one entry per distinct language: the two
+    English variants translate identically, so they collapse to "English".
+    """
+    out = [(AUTO_DETECT, "Auto-detect")]
+    seen: set[str] = set()
+    for lang in LANGUAGES.values():
+        if lang.google_code in seen:
+            continue
+        seen.add(lang.google_code)
+        out.append((lang.code, "English" if lang.google_code == "en" else lang.name))
+    return out
+
+
+def source_name(code: str) -> str:
+    return dict(source_languages()).get(code) or get_language(code).name
+
+
+def needs_translation(target: str, source: str = DEFAULT_SOURCE) -> bool:
+    """True if text in `source` must be translated to be read in `target`.
+
+    Auto-detect always translates; the service passes text that is already
+    in the target language through unchanged.
+    """
+    if source == AUTO_DETECT:
+        return True
+    return get_language(source).google_code != get_language(target).google_code

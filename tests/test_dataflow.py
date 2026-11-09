@@ -69,8 +69,8 @@ class TranslatorTests(unittest.TestCase):
         google = _FakeClient("g", self.log, fail_after=1)
         mymemory = _FakeClient("m", self.log)
         translator.BACKENDS = [
-            translator.Backend("g", 50, lambda _t: google, "google_code"),
-            translator.Backend("m", 50, lambda _t: mymemory, "mymemory_code"),
+            translator.Backend("g", 50, lambda _s, _t: google, "google_code"),
+            translator.Backend("m", 50, lambda _s, _t: mymemory, "mymemory_code"),
         ]
         translator.CHUNK_DELAY_SECONDS = 0
         translator._preferred = None

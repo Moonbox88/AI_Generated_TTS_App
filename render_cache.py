@@ -24,6 +24,7 @@ class RenderKey:
     voice: str
     speed: float
     translate: bool    # whether translation actually applies to this job
+    source: str = "a"  # translate-from language (or "auto")
 
 
 class RenderCache:

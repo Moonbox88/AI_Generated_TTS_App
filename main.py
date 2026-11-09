@@ -10,9 +10,9 @@ import tts
 from parsers import extract_text
 from translator import iter_translate
 from tts import speak
-from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES, VOICE_IDS,
-                    default_voice_for_lang, get_voice, needs_translation,
-                    voices_for_lang)
+from voices import (AUTO_DETECT, DEFAULT_LANG, DEFAULT_SOURCE, DEFAULT_VOICE,
+                    LANGUAGES, VOICE_IDS, default_voice_for_lang, get_voice,
+                    needs_translation, source_name, voices_for_lang)
 
 
 SPEED_RANGE = (0.5, 2.0)   # matches the GUI slider
@@ -66,7 +66,13 @@ def build_parser() -> argparse.ArgumentParser:
                    default=1.0, metavar="VOLUME",
                    help="Volume level %s to %s (default: 1.0)" % VOLUME_RANGE)
     p.add_argument("--translate", action="store_true",
-                   help="Translate input text from English to the target language first")
+                   help="Translate the input into the target language (-l) first. "
+                        "Input is English unless --from says otherwise")
+    p.add_argument("--from", dest="source", default=None,
+                   choices=[AUTO_DETECT, *LANGUAGES], metavar="LANG",
+                   help="Language the input is written in (implies --translate). "
+                        f"Same codes as -l, or '{AUTO_DETECT}' to detect it. "
+                        "E.g. -f doc.pdf --from pl reads a Polish document in English")
     p.add_argument("--no-play", action="store_true",
                    help="Synthesise to --output without playing audio")
     p.add_argument("--list-voices", action="store_true",
@@ -146,15 +152,19 @@ def main():
 
     segments = [text]
     translated: list[str] = []
-    if args.translate:
-        if not needs_translation(args.lang):
-            print(f"Target is {LANGUAGES[args.lang].name}; nothing to translate.")
+    source = args.source or DEFAULT_SOURCE
+    if args.translate or args.source:
+        target_name = LANGUAGES[args.lang].name
+        if not needs_translation(args.lang, source):
+            print(f"Input and target are both {target_name}; nothing to translate.")
         else:
-            print(f"Translating to {LANGUAGES[args.lang].name}...")
+            label = ("auto-detected language" if source == AUTO_DETECT
+                     else source_name(source))
+            print(f"Translating {label} → {target_name}...")
 
             def translated_segments():
                 # Each piece is spoken as soon as it arrives.
-                for piece in iter_translate(text, args.lang):
+                for piece in iter_translate(text, args.lang, source=source):
                     translated.append(piece)
                     print(f"Translated: {piece}")
                     yield piece

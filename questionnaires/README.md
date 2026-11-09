@@ -12,8 +12,8 @@ with the answers at the bottom of the file. Each file ends with a
 | 01_streaming_playback.md | `tts.py` | producer thread + audio callback |
 | 02_engines_and_voices.md | `engines/`, `voices.py` | plugin registry, lazy imports |
 | 03_parsers.md | `parsers.py` | text cleanup + mtime cache |
-| 04_translator.md | `translator.py` | chunking, retry, backend fallback |
-| 05_gui_threading.md | `gui.py` | keeping Tk responsive |
+| 04_translator.md | `translator.py` | any-to-any translation, chunking, fallback |
+| 05_gui_threading.md | `gui.py`, `gui_theme.py` | keeping Tk responsive, layout, theming |
 | 06_render_cache.md | `render_cache.py` | reuse last render on Save |
 
 Add a new file per module as the project grows (Phase 3: FastAPI backend).

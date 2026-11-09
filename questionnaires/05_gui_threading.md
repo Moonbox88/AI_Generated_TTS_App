@@ -11,6 +11,12 @@
 8. What is `selftest` for?
 9. `_segments` is a generator consumed on the *synthesis* thread. Why does it use `self.after(0, ...)` for the preview, and why `lambda p=piece:`?
 
+10. The main column uses `grid` but the inside of each card uses `pack`. Why did the main column need `grid`? (What happened to the buttons on a short screen?)
+11. Why is the progress bar `grid_remove()`d rather than `grid_forget()`ten when hidden?
+12. Shortcuts are bound on the root *and* on the text box. Why both, and why does the handler return `"break"`?
+13. Why does `gui_theme.py` use the `clam` theme, and why are plain `tk.Text` widgets styled separately (`style_text`)?
+14. Why does the GUI only use symbols like ▶ ⇄ ☾ and never emoji such as 📄 or 💾?
+15. How does `_on_swap` turn "Polish → American English" into "English → Polish"? Why can't it just copy the target code into the source box?
 ## Answers
 1. Tk isn't thread-safe. `self.after(0, fn)` queues `fn` to run on the Tk main loop, which is the safe cross-thread hop.
 2. It snapshots every widget value on the Tk thread so the worker uses a consistent job dict, and the user changing a slider mid-job can't alter it.
@@ -22,5 +28,11 @@
 8. Synthesises one phrase per language headlessly, so a frozen PyInstaller build can be checked for missing bundled data.
 9. It runs off the Tk thread, so widget updates must be queued with `after`. The default argument binds each piece's value; a bare closure would see only the loop variable's final value by the time Tk runs it.
 
+10. When the window is shorter than everything requested, `pack` clips whichever widgets were packed last, which here were the Save-to card and the action buttons. `grid` shrinks rows by weight, and only the text row has weight, so the text box gives up space and the buttons stay visible.
+11. `grid_remove` remembers the row/padding options, so a bare `.grid()` restores it exactly; `grid_forget` discards them.
+12. A root binding fires for any focused widget, but Tk's Text class has its own bindings (Ctrl+O inserts a newline, Return inserts a line break) that would run as well. A widget-level binding runs first, and returning "break" stops the class and root bindings from also firing.
+13. `clam` ships with Tk and, unlike native themes, lets every colour be set, so light/dark work everywhere with no new dependency (important for the PyInstaller build). ttk styles don't apply to classic Tk widgets such as Text and the combobox drop-down listbox, so those are configured directly.
+14. Tk 8.6 can't handle characters above U+FFFF (most emoji) and raises an error; the chosen symbols are in the Basic Multilingual Plane.
+15. The old source becomes the new target language (and voice list); the old target becomes the new source. The source list has one entry per language (one English), so the target is matched by translation code rather than copied (British English becomes the single English entry).
 ## Reusable snippet
-`_status_async` + `_gather_job` + worker-thread-then-`after` is the standard recipe for any Tk app doing slow work. Copy those three methods as a template.
+`_status_async` + `_gather_job` + worker-thread-then-`after` is the standard recipe for any Tk app doing slow work. Copy those three methods as a template. `gui_theme.py` is a self-contained light/dark ttk theme you can drop into any Tkinter app: call `setup_fonts`, `apply_theme`, then `style_text` on Text widgets.
