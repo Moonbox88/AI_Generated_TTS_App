@@ -9,6 +9,9 @@
 6. Why `CHUNK_DELAY_SECONDS` between chunks?
 7. `translate()` catches broad `Exception` per backend. Is that reasonable here?
 8. What does the `_results` memo save in the GUI flow, and why is it small?
+9. `iter_translate` is a generator and `translate` just joins it. Why build it that way round?
+10. If Google fails on piece 2 of 5, what happens to pieces 1, 3, 4, 5? How did the older whole-document fallback differ?
+11. Why is the result cached only after the loop finishes?
 
 ## Answers
 1. Google has better quality but rate-limits scraping and is blocked on some networks; MyMemory is the fallback.
@@ -19,6 +22,9 @@
 6. Politeness and avoiding rate-limit triggers.
 7. Yes: the goal is "try the next backend on any failure"; failures are collected and reported in `TranslationError`.
 8. Speak followed by Save (or repeats) translate identical text; a hit skips the network entirely. Small because texts can be large.
+9. Streaming is the general case: a consumer (TTS, preview) can act on piece 1 while piece 2 is in flight. A blocking version is a one-line wrapper; you can't go the other way.
+10. Piece 1 keeps Google's result; piece 2 is retried on MyMemory (re-split to 450 chars); `_preferred` becomes MyMemory so 3-5 go straight there. Before, a mid-document failure threw away finished work and re-translated everything.
+11. If the consumer stops early (user hits Stop) the generator is closed partway; caching then would store a truncated translation as if complete.
 
 ## Reusable snippet
 `chunk_text` / `_split_oversized` are generic "split to a size limit while preserving structure" helpers (LLM context windows, API limits). `translate()` shows a fallback-chain pattern: ordered backends, preferred-first sort, aggregated error.

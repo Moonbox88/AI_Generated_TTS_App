@@ -4,11 +4,19 @@ Audio is played as it is synthesised rather than after the whole document
 is rendered, so a long PDF starts speaking after the first sentence. Each
 chunk carries its own sample rate, so Kokoro (24 kHz) and Piper (22.05 kHz)
 voices both play back at the correct pitch.
+
+Data flow:  text segments ─▶ engine.stream ─▶ chunks ─┬─▶ _ChunkBuffer ─▶ speaker
+                                                      ├─▶ output file (streamed)
+                                                      └─▶ _parts (synthesise() only)
+Text may arrive as a lazy iterable (e.g. translated a piece at a time), so
+synthesis of the first piece overlaps fetching the rest.
 """
 
+import os
+import pathlib
 import queue
 import threading
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional, Union
 
 import numpy as np
 
@@ -28,14 +36,30 @@ class _ChunkBuffer:
     without an audio device.
     """
 
-    def __init__(self):
-        self._queue: queue.Queue = queue.Queue()
+    # Synthesis runs much faster than real time, so an unbounded queue would
+    # end up holding a whole document's audio. A few chunks (each a sentence
+    # or so) is plenty of headroom; beyond that the producer waits.
+    MAX_QUEUED = 8
+
+    def __init__(self, max_queued: int = MAX_QUEUED):
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queued)
         self._current: Optional[np.ndarray] = None
         self._pos = 0
         self._closed = threading.Event()
 
-    def put(self, samples: np.ndarray) -> None:
-        self._queue.put(samples)
+    def put(self, samples: np.ndarray, cancelled: Optional[threading.Event] = None) -> bool:
+        """Queue a chunk, waiting while the buffer is full.
+
+        Returns False if `cancelled` was set while waiting (the chunk is
+        dropped), so a stopped job never leaves its producer blocked.
+        """
+        while cancelled is None or not cancelled.is_set():
+            try:
+                self._queue.put(samples, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
 
     def close(self) -> None:
         """Signal that no further chunks will arrive."""
@@ -62,7 +86,14 @@ class _ChunkBuffer:
                     out[written:frames, 0] = 0.0
                     return self.is_closed
             take = min(frames - written, len(self._current) - self._pos)
-            out[written:written + take, 0] = self._current[self._pos:self._pos + take] * volume
+            src = self._current[self._pos:self._pos + take]
+            dst = out[written:written + take, 0]
+            # Runs on the real-time audio thread: write in place rather than
+            # allocating a scaled temporary on every callback.
+            if volume == 1.0:
+                dst[:] = src
+            else:
+                np.multiply(src, volume, out=dst)
             self._pos += take
             written += take
         return False
@@ -86,6 +117,8 @@ class Playback:
         self._producer: Optional[threading.Thread] = None
         self._parts: list[np.ndarray] = []
         self._keep_audio = True
+        self._writer = None  # soundfile.SoundFile, opened on the first chunk
+        self._tmp_path: Optional[pathlib.Path] = None
         self._on_status = on_status
         self.error: Optional[BaseException] = None
 
@@ -189,47 +222,94 @@ class Playback:
         self._stream.start()
         self._status("Playing...")
 
-    def _produce(self, text: str, voice: str, speed: float,
+    def _produce(self, segments: Iterable[str], voice: str, speed: float,
                  output_file: Optional[str], play: bool) -> None:
         try:
             engine = engine_for_voice(voice)
-            self._status("Synthesising...")
-            for samples, rate in engine.stream(text, voice, speed):
+            # Load the model while the first segment is still being fetched
+            # (e.g. translated). Failures are ignored here: engine.stream()
+            # retries the load and raises properly.
+            threading.Thread(target=self._prefetch, args=(engine, voice),
+                             daemon=True).start()
+            announced = False
+            for text in segments:
                 if self._cancelled.is_set():
                     break
-                if self._sample_rate is None:
-                    self._sample_rate = rate
-                if self._keep_audio:
-                    self._parts.append(samples)
-                if play:
-                    self._ensure_stream(rate)
-                    self._buffer.put(samples)
+                if not text.strip():
+                    continue
+                if not announced:
+                    self._status("Synthesising...")
+                    announced = True
+                for samples, rate in engine.stream(text, voice, speed):
+                    if self._cancelled.is_set():
+                        break
+                    self._consume(samples, rate, output_file, play)
         except BaseException as exc:  # surfaced via wait() / .error
             self.error = exc
         finally:
             self._buffer.close()
-            if output_file and not self._cancelled.is_set() and self.error is None:
-                self._write(output_file)
+            self._finish_file(output_file,
+                              ok=not self._cancelled.is_set() and self.error is None)
             # Nothing was ever queued, so no stream exists to signal completion.
             if self._stream is None:
                 self._finished.set()
 
-    def _write(self, output_file: str) -> None:
-        audio = self.audio()
-        if audio.size == 0:
-            return
-        import soundfile as sf
-        sf.write(output_file, audio, self._sample_rate)
-        self._status(f"Saved to {output_file}")
+    @staticmethod
+    def _prefetch(engine, voice: str) -> None:
+        try:
+            engine.prepare(voice)
+        except Exception:
+            pass
 
-    def start(self, text: str, voice: str, speed: float,
+    def _consume(self, samples: np.ndarray, rate: int,
+                 output_file: Optional[str], play: bool) -> None:
+        """Fan one chunk out to every sink that wants it."""
+        if self._sample_rate is None:
+            self._sample_rate = rate
+        if self._keep_audio:
+            self._parts.append(samples)
+        if output_file:
+            self._write_chunk(output_file, samples, rate)
+        if play:
+            self._ensure_stream(rate)
+            self._buffer.put(samples, self._cancelled)
+
+    # Streaming the file means saving never needs the whole document in
+    # memory. It is written to a temp name and renamed only on success, so a
+    # cancelled or failed job leaves no truncated file behind.
+
+    def _write_chunk(self, output_file: str, samples: np.ndarray, rate: int) -> None:
+        if self._writer is None:
+            import soundfile as sf
+            target = pathlib.Path(output_file)
+            fmt = target.suffix.lstrip(".").upper()
+            if fmt not in sf.available_formats():
+                fmt = "WAV"
+            self._tmp_path = target.with_name(target.name + ".part")
+            self._writer = sf.SoundFile(str(self._tmp_path), "w", samplerate=rate,
+                                        channels=1, format=fmt)
+        self._writer.write(samples)
+
+    def _finish_file(self, output_file: Optional[str], ok: bool) -> None:
+        if self._writer is None:
+            return
+        self._writer.close()
+        self._writer = None
+        if ok:
+            os.replace(self._tmp_path, output_file)
+            self._status(f"Saved to {output_file}")
+        else:
+            self._tmp_path.unlink(missing_ok=True)
+
+    def start(self, text: Union[str, Iterable[str]], voice: str, speed: float,
               output_file: Optional[str], play: bool) -> "Playback":
-        # Playing without saving never reads the audio back, so don't hold
-        # a whole document's samples in memory for nothing.
-        self._keep_audio = bool(output_file) or not play
+        segments = [text] if isinstance(text, str) else text
+        # Saving streams to disk and playing streams to the speaker; only a
+        # caller of synthesise() needs the samples kept in memory.
+        self._keep_audio = not output_file and not play
         self._producer = threading.Thread(
             target=self._produce,
-            args=(text, voice, speed, output_file, play),
+            args=(segments, voice, speed, output_file, play),
             daemon=True,
         )
         self._producer.start()
@@ -241,7 +321,7 @@ class Playback:
 # ----------------------------------------------------------------------
 
 def speak(
-    text: str,
+    text: Union[str, Iterable[str]],
     voice: str = DEFAULT_VOICE,
     speed: float = DEFAULT_SPEED,
     volume: float = DEFAULT_VOLUME,
@@ -250,6 +330,10 @@ def speak(
     on_status: StatusCallback = None,
 ) -> Playback:
     """Synthesise text and start streaming playback.
+
+    `text` is a string or an iterable of strings consumed lazily on the
+    producer thread; an exception raised by the iterable surfaces through
+    .wait() / .error like any synthesis error.
 
     Returns immediately with a Playback handle; call .wait() to block.
     """

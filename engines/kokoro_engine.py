@@ -1,5 +1,6 @@
 """Kokoro-82M engine."""
 
+import threading
 from typing import Iterator
 
 import numpy as np
@@ -25,18 +26,22 @@ class KokoroEngine:
     def __init__(self):
         self._pipelines: dict[str, object] = {}
         self._model = None
+        # prepare() runs on a prefetch thread alongside stream(); without the
+        # lock both could load the model at once.
+        self._lock = threading.Lock()
 
     def _pipeline(self, lang_code: str):
-        if lang_code not in self._pipelines:
-            from kokoro import KModel, KPipeline
-            # The 82M model is language-agnostic; only the G2P front end
-            # differs per language. Load the weights once and share them
-            # instead of once per language pipeline.
-            if self._model is None:
-                self._model = KModel(repo_id=REPO_ID).eval()
-            self._pipelines[lang_code] = KPipeline(
-                lang_code=lang_code, repo_id=REPO_ID, model=self._model)
-        return self._pipelines[lang_code]
+        with self._lock:
+            if lang_code not in self._pipelines:
+                from kokoro import KModel, KPipeline
+                # The 82M model is language-agnostic; only the G2P front end
+                # differs per language. Load the weights once and share them
+                # instead of once per language pipeline.
+                if self._model is None:
+                    self._model = KModel(repo_id=REPO_ID).eval()
+                self._pipelines[lang_code] = KPipeline(
+                    lang_code=lang_code, repo_id=REPO_ID, model=self._model)
+            return self._pipelines[lang_code]
 
     def prepare(self, voice: str) -> None:
         self._pipeline(get_voice(voice).lang)

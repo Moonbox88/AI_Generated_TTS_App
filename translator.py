@@ -144,6 +144,62 @@ def _run_backend(backend: Backend, text: str, lang_code: str,
     return "\n\n".join(out)
 
 
+def _translate_piece(piece: str, lang_code: str) -> str:
+    """Translate one piece, trying the last working backend first."""
+    global _preferred
+    ordered = sorted(BACKENDS, key=lambda b: b.name != _preferred)
+    failures = []
+    for backend in ordered:
+        try:
+            result = _run_backend(backend, piece, lang_code, None)
+        except Exception as exc:
+            failures.append(f"{backend.name}: {type(exc).__name__}")
+            continue
+        _preferred = backend.name
+        return result
+    raise TranslationError(
+        "All translation backends failed (" + "; ".join(failures) + ")"
+    )
+
+
+def iter_translate(
+    text: str,
+    lang_code: str,
+    on_progress: Optional[Callable[[int, int], None]] = None,
+) -> Iterator[str]:
+    """Translate text, yielding each translated piece as soon as it is ready.
+
+    Feeding this straight into tts.speak() lets the first paragraph start
+    speaking while the rest is still being translated. Pieces are sized to
+    the largest backend limit; if a backend fails part-way, only the
+    remaining pieces move to the fallback (re-split to its own limit).
+    The full result is cached once every piece has been translated.
+    """
+    if not needs_translation(lang_code) or not text.strip():
+        yield text
+        return
+
+    cached = _results.get((lang_code, text))
+    if cached is not None:
+        yield cached
+        return
+
+    pieces = chunk_text(text, max(b.max_chars for b in BACKENDS))
+    out: list[str] = []
+    for index, piece in enumerate(pieces, start=1):
+        if on_progress:
+            on_progress(index, len(pieces))
+        if index > 1:
+            time.sleep(CHUNK_DELAY_SECONDS)
+        result = _translate_piece(piece, lang_code)
+        out.append(result)
+        yield result
+
+    if len(_results) >= _RESULT_LIMIT:
+        _results.pop(next(iter(_results)))
+    _results[(lang_code, text)] = "\n\n".join(out)
+
+
 def translate(
     text: str,
     lang_code: str,
@@ -154,31 +210,4 @@ def translate(
     Returns the text unchanged if the target is English. Falls back to the
     next backend if one is unavailable or rate-limited.
     """
-    global _preferred
-
-    if not needs_translation(lang_code):
-        return text
-    if not text.strip():
-        return text
-
-    cached = _results.get((lang_code, text))
-    if cached is not None:
-        return cached
-
-    ordered = sorted(BACKENDS, key=lambda b: b.name != _preferred)
-    failures = []
-    for backend in ordered:
-        try:
-            result = _run_backend(backend, text, lang_code, on_progress)
-        except Exception as exc:
-            failures.append(f"{backend.name}: {type(exc).__name__}")
-            continue
-        _preferred = backend.name
-        if len(_results) >= _RESULT_LIMIT:
-            _results.pop(next(iter(_results)))
-        _results[(lang_code, text)] = result
-        return result
-
-    raise TranslationError(
-        "All translation backends failed (" + "; ".join(failures) + ")"
-    )
+    return "\n\n".join(iter_translate(text, lang_code, on_progress))

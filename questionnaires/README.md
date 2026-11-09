@@ -16,3 +16,7 @@ with the answers at the bottom of the file. Each file ends with a
 | 05_gui_threading.md | `gui.py` | keeping Tk responsive |
 
 Add a new file per module as the project grows (Phase 3: FastAPI backend).
+
+The behaviour these quizzes describe is checked by `tests/test_dataflow.py`
+(`python -m unittest discover -s tests -v`). Reading a test next to its
+question is a good way to confirm an answer.

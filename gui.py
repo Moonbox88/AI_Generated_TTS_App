@@ -8,8 +8,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from parsers import extract_text
-from translator import translate
-from tts import Playback, prepare, speak
+from translator import iter_translate
+from tts import Playback, speak
 from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES,
                     needs_translation, voices_for_lang)
 
@@ -212,23 +212,15 @@ class App(tk.Tk):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _get_text(self) -> str | None:
-        """Read the input. Must run on the Tk thread (it may show dialogs)."""
-        file_path = self._file_path.get()
-        if file_path:
-            try:
-                text = extract_text(file_path)
-            except Exception as e:
-                messagebox.showerror("File error", str(e))
-                return None
-            if not text.strip():
-                messagebox.showwarning("No text", "No readable text found in that file.")
-                return None
-            return text
-        text = self._text_box.get("1.0", "end").strip()
-        if not text:
-            messagebox.showwarning("No input", "Enter some text or load a file.")
-            return None
+    @staticmethod
+    def _load_text(job: dict) -> str:
+        """Worker-thread step: parse the file (seconds for a big PDF) so the
+        window stays responsive. Errors reach the user via _on_job_failed."""
+        if not job["file"]:
+            return job["text"]
+        text = extract_text(job["file"])
+        if not text.strip():
+            raise ValueError("No readable text found in that file.")
         return text
 
     def _selected_lang_code(self) -> str:
@@ -255,16 +247,30 @@ class App(tk.Tk):
     def _on_voice_changed(self, _event=None):
         self._voice.set(self._voice_ids.get(self._voice_cb.get(), ""))
 
-    def _translate_if_needed(self, text: str, lang: str, translate_on: bool) -> str:
-        """Worker-thread step: translate and show the preview."""
-        if translate_on and needs_translation(lang):
-            def progress(done, total):
-                if total > 1:
-                    self._status_async(f"Translating... ({done}/{total})")
-            self._status_async("Translating...")
-            text = translate(text, lang, on_progress=progress)
-            self.after(0, lambda: self._show_preview(text))
-        return text
+    @staticmethod
+    def _wants_translation(job: dict) -> bool:
+        return job["translate"] and needs_translation(job["lang"])
+
+    def _segments(self, job: dict, text: str, collected: list[str]):
+        """Text for speak(), translated lazily a piece at a time.
+
+        Consumed on the synthesis thread, so the first translated paragraph
+        is speaking while later ones are still being fetched. Every piece is
+        appended to `collected` for the preview and the saved .txt.
+        """
+        if not self._wants_translation(job):
+            yield text
+            return
+
+        def progress(done, total):
+            self._status_async(f"Translating... ({done}/{total})" if total > 1
+                               else "Translating...")
+
+        self.after(0, lambda: self._show_preview(""))
+        for piece in iter_translate(text, job["lang"], on_progress=progress):
+            collected.append(piece)
+            self.after(0, lambda p=piece: self._append_preview(p))
+            yield piece
 
     def _gather_job(self) -> dict | None:
         """Snapshot every input on the Tk thread before starting a worker."""
@@ -272,10 +278,13 @@ class App(tk.Tk):
         if not voice:
             messagebox.showwarning("No voice", "Choose a voice first.")
             return None
-        text = self._get_text()
-        if not text:
+        file_path = self._file_path.get()
+        text = "" if file_path else self._text_box.get("1.0", "end").strip()
+        if not file_path and not text:
+            messagebox.showwarning("No input", "Enter some text or load a file.")
             return None
         return {
+            "file": file_path,
             "text": text,
             "lang": self._selected_lang_code(),
             "voice": voice,
@@ -289,6 +298,13 @@ class App(tk.Tk):
         self._preview_box.config(state="normal")
         self._preview_box.delete("1.0", "end")
         self._preview_box.insert("1.0", text)
+        self._preview_box.config(state="disabled")
+
+    def _append_preview(self, piece: str):
+        self._preview_box.config(state="normal")
+        if self._preview_box.get("1.0", "end-1c"):
+            self._preview_box.insert("end", "\n\n")
+        self._preview_box.insert("end", piece)
         self._preview_box.config(state="disabled")
 
     def _hide_preview(self):
@@ -345,11 +361,12 @@ class App(tk.Tk):
 
         def do_speak():
             try:
-                text = self._translate_if_needed(job["text"], job["lang"], job["translate"])
-                prepare(job["voice"], on_status=self._status_async)
-                ctrl = speak(text, voice=job["voice"], speed=job["speed"],
-                             volume=job["volume"], output_file=output,
-                             on_status=self._status_async)
+                self._status_async("Loading...")
+                text = self._load_text(job)
+                # speak() loads the voice itself, overlapped with translation.
+                ctrl = speak(self._segments(job, text, []), voice=job["voice"],
+                             speed=job["speed"], volume=job["volume"],
+                             output_file=output, on_status=self._status_async)
             except Exception as e:
                 self.after(0, lambda err=e: self._on_job_failed(err))
                 return
@@ -408,14 +425,16 @@ class App(tk.Tk):
 
         def do_save():
             try:
-                text = self._translate_if_needed(job["text"], job["lang"], job["translate"])
-                prepare(job["voice"], on_status=self._status_async)
-                self._status_async("Saving...")
-                speak(text, voice=job["voice"], speed=job["speed"],
-                      output_file=output, play=False).wait()
-                translated = job["translate"] and needs_translation(job["lang"])
+                self._status_async("Loading...")
+                text = self._load_text(job)
+                collected: list[str] = []
+                speak(self._segments(job, text, collected), voice=job["voice"],
+                      speed=job["speed"], output_file=output, play=False,
+                      on_status=self._status_async).wait()
+                translated = self._wants_translation(job)
                 if translated:
-                    pathlib.Path(output).with_suffix(".txt").write_text(text, encoding="utf-8")
+                    pathlib.Path(output).with_suffix(".txt").write_text(
+                        "\n\n".join(collected), encoding="utf-8")
             except Exception as e:
                 self.after(0, lambda err=e: self._on_job_failed(err))
                 return

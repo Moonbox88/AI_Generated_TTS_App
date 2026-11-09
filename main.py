@@ -6,7 +6,7 @@ import pathlib
 import sys
 
 from parsers import extract_text
-from translator import translate
+from translator import iter_translate
 from tts import speak
 from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES, VOICE_IDS,
                     default_voice_for_lang, get_voice, needs_translation,
@@ -116,36 +116,44 @@ def main():
         print("Error: no text to speak.", file=sys.stderr)
         sys.exit(1)
 
+    # Validate before any network or synthesis work is done.
+    if args.no_play and not args.output:
+        print("Error: --no-play requires --output.", file=sys.stderr)
+        sys.exit(1)
+
+    segments = [text]
+    translated: list[str] = []
     if args.translate:
         if not needs_translation(args.lang):
             print(f"Target is {LANGUAGES[args.lang].name}; nothing to translate.")
         else:
             print(f"Translating to {LANGUAGES[args.lang].name}...")
-            try:
-                text = translate(text, args.lang)
-            except Exception as e:
-                print(f"Error: translation failed: {e}", file=sys.stderr)
-                sys.exit(1)
-            print(f"Translated: {text}")
-            if args.output:
-                txt_path = pathlib.Path(args.output).with_suffix(".txt")
-                txt_path.write_text(text, encoding="utf-8")
-                print(f"Translated text saved to {txt_path}")
 
-    if args.no_play and not args.output:
-        print("Error: --no-play requires --output.", file=sys.stderr)
-        sys.exit(1)
+            def translated_segments():
+                # Each piece is spoken as soon as it arrives.
+                for piece in iter_translate(text, args.lang):
+                    translated.append(piece)
+                    print(f"Translated: {piece}")
+                    yield piece
 
-    playback = speak(text, voice=voice, speed=args.speed, volume=args.volume,
+            segments = translated_segments()
+
+    playback = speak(segments, voice=voice, speed=args.speed, volume=args.volume,
                      output_file=args.output, play=not args.no_play,
-                     on_status=lambda m: print(m))
+                     on_status=print)
     try:
         playback.wait()
     except KeyboardInterrupt:
         playback.stop()
+        sys.exit(130)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+    if translated and args.output:
+        txt_path = pathlib.Path(args.output).with_suffix(".txt")
+        txt_path.write_text("\n\n".join(translated), encoding="utf-8")
+        print(f"Translated text saved to {txt_path}")
 
 
 if __name__ == "__main__":
