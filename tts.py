@@ -16,6 +16,8 @@ import os
 import pathlib
 import queue
 import threading
+import time
+import weakref
 from typing import Callable, Iterable, Optional, Union
 
 import numpy as np
@@ -27,6 +29,64 @@ DEFAULT_SPEED = 1.0
 DEFAULT_VOLUME = 1.0
 
 StatusCallback = Optional[Callable[[str], None]]
+
+
+# ----------------------------------------------------------------------
+# Worker-thread registry and clean shutdown
+# ----------------------------------------------------------------------
+# Synthesis threads spend most of their time inside torch / onnxruntime.
+# If the interpreter exits while one is mid-call, the C++ runtime aborts
+# the process ("terminate called without an active exception"). Every
+# thread that may enter native code is started through _spawn so that
+# shutdown() can stop the jobs and wait for those threads to come out.
+
+_registry_lock = threading.Lock()
+_threads: set[threading.Thread] = set()
+_jobs: "weakref.WeakSet[Playback]" = weakref.WeakSet()
+_shutting_down = threading.Event()
+
+
+def _spawn(target: Callable, *args) -> threading.Thread:
+    def run():
+        try:
+            target(*args)
+        finally:
+            with _registry_lock:
+                _threads.discard(threading.current_thread())
+
+    thread = threading.Thread(target=run, daemon=True)
+    with _registry_lock:
+        if _shutting_down.is_set():
+            raise RuntimeError("TTS is shutting down")
+        _threads.add(thread)
+    thread.start()
+    return thread
+
+
+def shutdown(timeout: float = 5.0) -> bool:
+    """Stop every job and wait for synthesis threads to finish.
+
+    Call before the program exits. Stop takes effect between sentences, so
+    this normally returns within about a second. Returns False if a thread
+    is still busy after `timeout` (e.g. a first-run model download); the
+    caller should then leave with os._exit(), which skips the interpreter
+    teardown that would abort. No new jobs can start afterwards.
+    """
+    _shutting_down.set()
+    with _registry_lock:
+        jobs = list(_jobs)
+    for job in jobs:
+        job.stop()
+    deadline = time.monotonic() + timeout
+    while True:
+        with _registry_lock:
+            threads = list(_threads)
+        if not threads:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        threads[0].join(min(remaining, 0.1))
 
 
 class _ChunkBuffer:
@@ -264,8 +324,7 @@ class Playback:
             # Load the model while the first segment is still being fetched
             # (e.g. translated). Failures are ignored here: engine.stream()
             # retries the load and raises properly.
-            threading.Thread(target=self._prefetch, args=(engine, voice),
-                             daemon=True).start()
+            _spawn(self._prefetch, engine, voice)
             announced = False
             for text in segments:
                 if self._cancelled.is_set():
@@ -349,12 +408,10 @@ class Playback:
         # Saving streams to disk and playing streams to the speaker; only a
         # caller of synthesise() needs the samples kept in memory.
         self._keep_audio = not output_file and not play
-        self._producer = threading.Thread(
-            target=self._produce,
-            args=(segments, voice, speed, output_file, play),
-            daemon=True,
-        )
-        self._producer.start()
+        with _registry_lock:
+            _jobs.add(self)
+        self._producer = _spawn(self._produce, segments, voice, speed,
+                                output_file, play)
         return self
 
 

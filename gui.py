@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Text-to-Speech GUI — Phase 2 (Tkinter)."""
 
+import os
 import pathlib
 import sys
 import threading
@@ -10,6 +11,7 @@ from tkinter import filedialog, messagebox, ttk
 from parsers import extract_text
 from render_cache import RenderCache, RenderKey
 from translator import iter_translate
+import tts
 from tts import Playback, speak
 from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES,
                     needs_translation, voices_for_lang)
@@ -479,10 +481,18 @@ class App(tk.Tk):
         threading.Thread(target=do_save, daemon=True).start()
 
     def _on_close(self):
-        if self._controller:
-            self._controller.stop()
+        self.withdraw()  # disappear at once; shutdown below may take a moment
+        # Stop every job (Speak *and* Save) and let synthesis threads leave
+        # torch before Python tears down; exiting mid-call aborts the process.
+        clean = tts.shutdown(timeout=5)
         self._renders.close()
         self.destroy()
+        if not clean:
+            # A thread is still in native code (e.g. downloading a model).
+            # Skip interpreter teardown rather than crash during it.
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
 
 _SELFTEST_TEXT = {

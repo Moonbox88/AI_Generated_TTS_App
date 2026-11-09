@@ -12,6 +12,13 @@ from .base import Chunk
 SAMPLE_RATE = 24000
 REPO_ID = "hexgrad/Kokoro-82M"
 
+# Kokoro's default splits only on newlines and then packs up to 510 phonemes
+# (~25 s of speech) into one chunk. A chunk is one uninterruptible model call,
+# so Stop could lag by many seconds and the first audio arrived late. Split at
+# sentence ends instead: Latin punctuation followed by whitespace, Hindi
+# danda, and CJK full stops (which aren't followed by spaces).
+SENTENCE_SPLIT = r"\n+|(?<=[.!?…।])\s+|(?<=[。！？])"
+
 
 def _to_float32(audio) -> np.ndarray:
     """Kokoro yields torch tensors; normalise to a float32 numpy array."""
@@ -48,7 +55,8 @@ class KokoroEngine:
 
     def stream(self, text: str, voice: str, speed: float) -> Iterator[Chunk]:
         pipeline = self._pipeline(get_voice(voice).lang)
-        for _, _, audio in pipeline(text, voice=voice, speed=speed):
+        for _, _, audio in pipeline(text, voice=voice, speed=speed,
+                                    split_pattern=SENTENCE_SPLIT):
             samples = _to_float32(audio)
             if samples.size:
                 yield samples, SAMPLE_RATE

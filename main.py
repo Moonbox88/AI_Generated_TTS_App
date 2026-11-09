@@ -2,9 +2,11 @@
 """Text-to-Speech CLI."""
 
 import argparse
+import os
 import pathlib
 import sys
 
+import tts
 from parsers import extract_text
 from translator import iter_translate
 from tts import speak
@@ -165,7 +167,12 @@ def main():
     try:
         playback.wait()
     except KeyboardInterrupt:
-        playback.stop()
+        # Let synthesis leave torch before exiting; exiting mid-call aborts
+        # the process. If it's stuck (e.g. downloading), skip teardown.
+        if not tts.shutdown(timeout=5):
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(130)
         sys.exit(130)
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
