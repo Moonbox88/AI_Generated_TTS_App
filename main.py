@@ -171,6 +171,8 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
+    if args.output:
+        print(f"Saved to {args.output}")
     if translated and args.output:
         txt_path = pathlib.Path(args.output).with_suffix(".txt")
         txt_path.write_text("\n\n".join(translated), encoding="utf-8")

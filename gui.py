@@ -8,6 +8,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from parsers import extract_text
+from render_cache import RenderCache, RenderKey
 from translator import iter_translate
 from tts import Playback, speak
 from voices import (DEFAULT_LANG, DEFAULT_VOICE, LANGUAGES,
@@ -41,6 +42,7 @@ class App(tk.Tk):
         self._controller: Playback | None = None
         self._voice_ids: dict[str, str] = {}  # combobox label -> voice id
         self._synthesising = False
+        self._renders = RenderCache()  # last finished render, for instant Save
 
         self._build_ui()
         self._set_icon()
@@ -363,16 +365,45 @@ class App(tk.Tk):
             try:
                 self._status_async("Loading...")
                 text = self._load_text(job)
-                # speak() loads the voice itself, overlapped with translation.
-                ctrl = speak(self._segments(job, text, []), voice=job["voice"],
+                key = self._render_key(job, text)
+                render = self._renders.new_path()
+                collected: list[str] = []
+                # Audio also streams to a temp WAV, so a later Save with the
+                # same inputs is a copy. speak() loads the voice itself,
+                # overlapped with translation.
+                ctrl = speak(self._segments(job, text, collected), voice=job["voice"],
                              speed=job["speed"], volume=job["volume"],
-                             output_file=output, on_status=self._status_async)
+                             output_file=str(render), on_status=self._status_async)
             except Exception as e:
                 self.after(0, lambda err=e: self._on_job_failed(err))
                 return
             self.after(0, lambda: self._on_playback_started(ctrl))
 
+            try:
+                ctrl.wait()
+            except Exception:
+                return  # _poll_playback reports the error
+            if ctrl.is_cancelled:
+                return  # stopped: Playback already discarded the partial file
+            self._renders.store(key, render, self._translated_text(job, collected))
+            if output:
+                try:
+                    self._renders.export(key, output)
+                except Exception as e:
+                    self.after(0, lambda err=e: messagebox.showerror("Save error", str(err)))
+                    return
+                self._status_async(f"Saved to {output}")
+
         threading.Thread(target=do_speak, daemon=True).start()
+
+    @classmethod
+    def _render_key(cls, job: dict, text: str) -> RenderKey:
+        return RenderKey(text=text, lang=job["lang"], voice=job["voice"],
+                         speed=job["speed"], translate=cls._wants_translation(job))
+
+    @classmethod
+    def _translated_text(cls, job: dict, collected: list[str]) -> str | None:
+        return "\n\n".join(collected) if cls._wants_translation(job) else None
 
     def _on_playback_started(self, ctrl: Playback):
         self._controller = ctrl
@@ -426,20 +457,23 @@ class App(tk.Tk):
         def do_save():
             try:
                 self._status_async("Loading...")
-                text = self._load_text(job)
-                collected: list[str] = []
-                speak(self._segments(job, text, collected), voice=job["voice"],
-                      speed=job["speed"], output_file=output, play=False,
-                      on_status=self._status_async).wait()
-                translated = self._wants_translation(job)
-                if translated:
-                    pathlib.Path(output).with_suffix(".txt").write_text(
-                        "\n\n".join(collected), encoding="utf-8")
+                text = self._load_text(job)  # cheap: parsers caches by mtime
+                key = self._render_key(job, text)
+                # Same inputs as the last Speak (or Save): copy, don't redo.
+                reused = self._renders.export(key, output)
+                if not reused:
+                    render = self._renders.new_path()
+                    collected: list[str] = []
+                    speak(self._segments(job, text, collected), voice=job["voice"],
+                          speed=job["speed"], output_file=str(render), play=False,
+                          on_status=self._status_async).wait()
+                    self._renders.store(key, render, self._translated_text(job, collected))
+                    self._renders.export(key, output)
             except Exception as e:
                 self.after(0, lambda err=e: self._on_job_failed(err))
                 return
-            msg = (f"Saved audio + translated text to {output}" if translated
-                   else f"Saved to {output}")
+            what = "audio + translated text" if key.translate else "audio"
+            msg = f"Saved {what} to {output}" + (" (reused last render)" if reused else "")
             self.after(0, lambda: (self._status.set(msg), self._set_busy(False)))
 
         threading.Thread(target=do_save, daemon=True).start()
@@ -447,6 +481,7 @@ class App(tk.Tk):
     def _on_close(self):
         if self._controller:
             self._controller.stop()
+        self._renders.close()
         self.destroy()
 
 

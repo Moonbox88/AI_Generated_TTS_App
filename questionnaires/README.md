@@ -14,6 +14,7 @@ with the answers at the bottom of the file. Each file ends with a
 | 03_parsers.md | `parsers.py` | text cleanup + mtime cache |
 | 04_translator.md | `translator.py` | chunking, retry, backend fallback |
 | 05_gui_threading.md | `gui.py` | keeping Tk responsive |
+| 06_render_cache.md | `render_cache.py` | reuse last render on Save |
 
 Add a new file per module as the project grows (Phase 3: FastAPI backend).
 

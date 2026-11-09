@@ -113,7 +113,10 @@ class Playback:
         self._sample_rate: Optional[int] = None
         self._paused = False
         self._cancelled = threading.Event()
-        self._finished = threading.Event()
+        self._finished = threading.Event()     # everything done, file included
+        self._stream_done = threading.Event()  # speaker has played the last sample
+        self._stream_lock = threading.Lock()
+        self._stream_closing = False
         self._producer: Optional[threading.Thread] = None
         self._parts: list[np.ndarray] = []
         self._keep_audio = True
@@ -136,13 +139,7 @@ class Playback:
         """Cancel synthesis and stop playback immediately."""
         self._cancelled.set()
         self._buffer.close()
-        stream = self._stream
-        if stream is not None:
-            try:
-                stream.abort()
-                stream.close()
-            except Exception:
-                pass
+        self._close_stream(abort=True)
         self._finished.set()
 
     def wait(self) -> None:
@@ -171,7 +168,12 @@ class Playback:
 
     @property
     def is_finished(self) -> bool:
+        """True once playback has ended and any output file is complete."""
         return self._finished.is_set()
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled.is_set()
 
     @property
     def sample_rate(self) -> Optional[int]:
@@ -202,12 +204,30 @@ class Playback:
         if self._buffer.read(outdata, frames, self._volume):
             raise sd.CallbackStop
 
+    def _close_stream(self, abort: bool = False) -> None:
+        """Close the stream exactly once.
+
+        stop() (UI thread) and the producer can both get here; PortAudio
+        handles must not be closed twice, so the first caller takes it.
+        """
+        with self._stream_lock:
+            stream = self._stream
+            if stream is None or self._stream_closing:
+                return
+            self._stream_closing = True
+        try:
+            if abort:
+                stream.abort()
+            stream.close()
+        except Exception:
+            pass
+
     def _ensure_stream(self, sample_rate: int) -> None:
-        if self._stream is not None:
+        if self._stream is not None or self._cancelled.is_set():
             return
         import sounddevice as sd
         self._sample_rate = sample_rate
-        self._stream = sd.OutputStream(
+        stream = sd.OutputStream(
             samplerate=sample_rate,
             channels=1,
             dtype="float32",
@@ -217,9 +237,24 @@ class Playback:
             blocksize=2048,
             latency=0.25,
             callback=self._callback,
-            finished_callback=self._finished.set,
+            finished_callback=self._stream_done.set,
         )
-        self._stream.start()
+        try:
+            stream.start()
+        except BaseException:
+            stream.close()
+            raise
+        # Only publish a stream that is actually running: _produce waits on
+        # _stream_done, which a stream that never started would never set.
+        # Under the lock so a stop() racing with start-up can't miss it.
+        with self._stream_lock:
+            if not self._cancelled.is_set():
+                self._stream = stream
+                stream = None
+        if stream is not None:  # stopped while starting: discard it
+            stream.abort()
+            stream.close()
+            return
         self._status("Playing...")
 
     def _produce(self, segments: Iterable[str], voice: str, speed: float,
@@ -248,11 +283,19 @@ class Playback:
             self.error = exc
         finally:
             self._buffer.close()
-            self._finish_file(output_file,
-                              ok=not self._cancelled.is_set() and self.error is None)
-            # Nothing was ever queued, so no stream exists to signal completion.
-            if self._stream is None:
-                self._finished.set()
+            try:
+                self._finish_file(output_file,
+                                  ok=not self._cancelled.is_set() and self.error is None)
+            except BaseException as exc:
+                self.error = self.error or exc
+            # Signal completion only when the file is in place *and* the
+            # speaker is done, so a caller that sees is_finished can use the
+            # file immediately. stop() aborts the stream, which sets
+            # _stream_done, so this never outlives a cancelled job.
+            if self._stream is not None:
+                self._stream_done.wait()
+                self._close_stream()  # release the audio device
+            self._finished.set()
 
     @staticmethod
     def _prefetch(engine, voice: str) -> None:
@@ -297,7 +340,6 @@ class Playback:
         self._writer = None
         if ok:
             os.replace(self._tmp_path, output_file)
-            self._status(f"Saved to {output_file}")
         else:
             self._tmp_path.unlink(missing_ok=True)
 
